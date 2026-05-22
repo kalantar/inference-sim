@@ -51,6 +51,8 @@
       
     
     
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
     <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -367,6 +369,28 @@
     
   
   Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../blog/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Blog
 
         </a>
       </li>
@@ -841,6 +865,8 @@
       
         
       
+        
+      
     
     
     
@@ -1128,6 +1154,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../guide/observe-replay-calibrate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observe / Replay / Calibrate
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../guide/experimentation/" class="md-nav__link">
         
   
@@ -1203,6 +1257,8 @@
       
         
       
+        
+      
     
     
     
@@ -1266,6 +1322,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../reference/project-structure/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project Structure
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../reference/configuration/" class="md-nav__link">
         
   
@@ -1301,7 +1385,7 @@
   <span class="md-ellipsis">
     
   
-    Supported Models
+    Model Compatibility
   
 
     
@@ -1685,6 +1769,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#adding-fields-to-tracev2-format" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Adding Fields to TraceV2 Format
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#adding-new-latency-model-backends" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1700,6 +1795,28 @@
     <span class="md-ellipsis">
       
         Adding New Batch Formation Strategies
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#adding-new-quantization-formats" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Adding New Quantization Formats
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#adding-a-new-engine" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Adding a New Engine
       
     </span>
   </a>
@@ -1947,7 +2064,7 @@
   <span class="md-ellipsis">
     
   
-    Antipattern Rules (R1-R20)
+    Antipattern Rules (R1-R23)
   
 
     
@@ -1975,7 +2092,7 @@
   <span class="md-ellipsis">
     
   
-    System Invariants (INV-1-8)
+    System Invariants (INV-1-INV-11)
   
 
     
@@ -2247,6 +2364,374 @@
   
 
     
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_8" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../blog/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Blog
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_8" id="__nav_8_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Blog
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_8_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_8_2" id="__nav_8_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Archive
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_8_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Archive
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+    
+  
+  
+    <li class="md-nav__item">
+      <a href="../../blog/archive/2026/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    2026
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_8_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_8_3" id="__nav_8_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Categories
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_8_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Categories
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+    
+  
+  
+    <li class="md-nav__item">
+      <a href="../../blog/category/architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+    
+  
+  
+    <li class="md-nav__item">
+      <a href="../../blog/category/capacity-planning/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capacity Planning
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+    
+  
+  
+    <li class="md-nav__item">
+      <a href="../../blog/category/deep-dives/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deep Dives
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+    
+  
+  
+    <li class="md-nav__item">
+      <a href="../../blog/category/what-is-blis/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    What is BLIS?
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
   </ul>
 </nav>
                   </div>
@@ -2318,6 +2803,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#adding-fields-to-tracev2-format" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Adding Fields to TraceV2 Format
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#adding-new-latency-model-backends" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2333,6 +2829,28 @@
     <span class="md-ellipsis">
       
         Adding New Batch Formation Strategies
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#adding-new-quantization-formats" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Adding New Quantization Formats
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#adding-a-new-engine" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Adding a New Engine
       
     </span>
   </a>
@@ -2378,7 +2896,6 @@
 <li><strong>Implement the interface</strong> in the corresponding file:</li>
 <li><code>AdmissionPolicy</code> → <code>sim/admission.go</code> (cluster-level: receives <code>*RouterState</code> with snapshots + clock)</li>
 <li><code>RoutingPolicy</code> → <code>sim/routing.go</code> (cluster-level: receives <code>*RouterState</code> with snapshots + clock)</li>
-<li><code>PriorityPolicy</code> → <code>sim/priority.go</code> (instance-level: receives <code>req</code> + <code>clock</code> only)</li>
 <li><code>InstanceScheduler</code> → <code>sim/scheduler.go</code> (instance-level: receives <code>requests</code> + <code>clock</code> only)</li>
 <li>
 <p>Note: <code>RouterState</code> is a bridge type in <code>sim/</code> to avoid import cycles — see <code>sim/router_state.go</code></p>
@@ -2403,7 +2920,7 @@
 <p><strong>Update documentation</strong>: CLAUDE.md file organization, README policy lists</p>
 </li>
 </ol>
-<p><strong>Important:</strong> For load-based routing, use <code>snap.EffectiveLoad()</code> — never compute <code>QueueDepth + BatchSize + InFlightRequests</code> inline. This ensures all routing policies use the same formula.</p>
+<p><strong>Important:</strong> For composite load signals, use <code>snap.EffectiveLoad()</code> — never compute <code>QueueDepth + BatchSize + InFlightRequests</code> inline. For queue-depth-only signals, use <code>snap.QueueDepth</code> directly.</p>
 <p>Examples:
 - See <code>RejectAll</code> in <code>sim/admission.go</code> for a simple admission template (constant return)
 - See <code>newPrefixAffinityScorer</code> in <code>sim/routing_prefix_scorer.go</code> for a stateful scorer with observer-based state updates (the prefix-affinity scorer uses a router-side <code>PrefixCacheIndex</code> to track per-instance block hash history)</p>
@@ -2429,8 +2946,8 @@
 <li><strong>Add CLI flags</strong> in <code>cmd/root.go</code> for new parameters (e.g., <code>--kv-nvme-blocks</code>) and wire them into the <code>KVCacheConfig</code> sub-config</li>
 <li><strong>Aggregate metrics</strong> — combine hit/miss/thrashing counters from all tiers; see <code>TieredKVCache.CacheHitRate()</code> for the 2-tier pattern</li>
 <li><strong>Add behavioral tests</strong> in <code>sim/kv/*_test.go</code></li>
-<li><strong>Preserve rollback semantics</strong> — <code>KVCacheState.AllocateKVBlocks</code> is transactional: on mid-loop failure, <code>rollbackAllocation()</code> undoes all mutations (UsedBlockCnt, CacheMisses, CacheHits, RefCount, InUse, free list, HashToBlock, RequestMap). If your tier adds mutations beyond what delegation to <code>gpu.AllocateKVBlocks()</code> handles, you must roll those back too. See <code>cachedBlockMutation</code> and <code>newBlockMutation</code> types in <code>sim/kv/cache.go</code>.</li>
-<li><strong><code>GetCachedBlocks</code> is a pure query</strong> — it returns cached block IDs without side effects. <code>CacheHits</code> are counted by <code>AllocateKVBlocks</code> when cached blocks are committed to an allocation (and rolled back on failure). This was fixed in the Phase 3 hardening PR; the previous implementation incremented CacheHits in GetCachedBlocks, causing double-counting in tiered mode.</li>
+<li><strong>Check-then-act allocation (no rollback)</strong> — <code>KVCacheState.AllocateKVBlocks</code> uses a pre-check gate: it computes the total blocks needed (new blocks + cached blocks leaving the free list) and compares against <code>countFreeBlocks()</code> before any state mutation. If insufficient, it returns <code>false</code> immediately with zero side effects. Post-pre-check <code>popFreeBlock() == nil</code> is a <code>panic</code> (INV-4 violation, structurally unreachable in single-threaded DES). This mirrors vLLM's <code>kv_cache_manager.py:334-336</code> universal pre-check. If your tier adds mutations before delegating to <code>gpu.AllocateKVBlocks()</code>, ensure the inner pre-check sees the updated <code>FreeBlockCnt</code> (e.g., <code>commitCachedBlocks</code> calls <code>removeFromFreeList</code> which decrements <code>FreeBlockCnt</code> before the inner call).</li>
+<li><strong><code>GetCachedBlocks</code> is a pure query</strong> — it returns cached block IDs without side effects. <code>CacheHits</code> are counted by <code>AllocateKVBlocks</code> when cached blocks are committed to an allocation. The pre-check accounts for cached blocks with <code>!InUse</code> (on the free list) via the <code>cachedFromFreeList</code> budget, mirroring vLLM's <code>num_evictable_blocks</code>.</li>
 </ol>
 <p>Examples:
 - See <code>TieredKVCache</code> in <code>sim/kv/tiered.go</code> for 2-tier GPU+CPU composition
@@ -2450,6 +2967,30 @@
 - See <code>AdmissionRecord</code> in <code>sim/trace/record.go</code> for a simple record
 - See <code>RoutingRecord</code> with <code>CandidateScore</code> for a record with nested counterfactual data
 - See <code>computeCounterfactual()</code> in <code>sim/cluster/counterfactual.go</code> for derived computation that lives in <code>sim/cluster/</code> (not <code>sim/trace/</code>) because it needs <code>sim.RoutingSnapshot</code></p>
+<h2 id="adding-fields-to-tracev2-format">Adding Fields to TraceV2 Format<a class="headerlink" href="#adding-fields-to-tracev2-format" title="Permanent link">&para;</a></h2>
+<p>To add a new field to TraceV2 CSV output (e.g., observability metadata like <code>vllm_priority</code>):</p>
+<ol>
+<li><strong>Add field to <code>TraceRecord</code></strong> in <code>sim/workload/tracev2.go</code> (place logically near related fields)</li>
+<li><strong>Add field to <code>RequestRecord</code></strong> in <code>cmd/observe.go</code> (if captured during observation)</li>
+<li><strong>Capture the value</strong> in <code>RealClient.Send()</code> in <code>cmd/observe.go</code> (set field on <code>RequestRecord</code>)</li>
+<li><strong>Wire through Recorder</strong> in <code>cmd/observe.go</code>: Update <code>RecordRequest()</code> to copy field from <code>RequestRecord</code> to <code>TraceRecord</code></li>
+<li><strong>Update ExportTraceV2</strong> in <code>sim/workload/tracev2.go</code>:</li>
+<li>For <strong>optional columns</strong>: scan records to determine if column is needed, conditionally add to header, conditionally write values</li>
+<li>For <strong>always-present columns</strong>: add to <code>traceV2Columns</code> slice and write in row construction</li>
+<li><strong>Update LoadTraceV2/parseTraceRecord</strong> in <code>sim/workload/tracev2.go</code>:</li>
+<li>For <strong>optional columns</strong>: detect column presence from CSV header, apply offset to subsequent column indices</li>
+<li>For <strong>always-present columns</strong>: parse at fixed index, update all downstream indices</li>
+<li><strong>Enforce simulation isolation</strong> (if observability-only): Verify <code>LoadTraceV2Requests</code> and <code>LoadTraceV2SessionBlueprints</code> do NOT read the field into <code>sim.Request</code> — add tests for this</li>
+<li><strong>Add behavioral tests</strong> covering round-trip, conditional logic, and simulation isolation</li>
+</ol>
+<p><strong>Column position guidelines:</strong>
+- Observability metadata: place near related fields (e.g., <code>vllm_priority</code> after <code>slo_class</code>)
+- Timing data: group with other timestamps
+- Optional columns: prefer conditional inclusion over always-writing zero values</p>
+<p>Examples:
+- See PR #1220 (<code>VLLMPriority</code>) — optional column, simulation-isolated, conditional on SLOClass presence
+- See <code>FinishReason</code>/<code>ErrorMessage</code> fields — always-present optional strings (empty when not set)
+- See <code>ServerInputTokens</code> field — observability metadata that differs from <code>InputTokens</code></p>
 <h2 id="adding-new-latency-model-backends">Adding New Latency Model Backends<a class="headerlink" href="#adding-new-latency-model-backends" title="Permanent link">&para;</a></h2>
 <p>To add a new latency estimation backend (e.g., SGLang RadixAttention, TensorRT-LLM, neural surrogate):</p>
 <ol>
@@ -2458,17 +2999,16 @@
 <li><code>QueueingTime(req *Request) int64</code> — estimate arrival-to-queue delay</li>
 <li><code>OutputTokenProcessingTime() int64</code> — per-token post-processing overhead</li>
 <li><code>PostDecodeFixedOverhead() int64</code> — fixed per-request completion overhead (return 0 if not applicable)</li>
+<li><strong>All <code>float64 → int64</code> conversions MUST use <code>clampToInt64(v)</code> (defined in <code>sim/latency/latency.go</code>).</strong> Direct <code>int64(v)</code> casts on float64 values are undefined behavior in Go when the value is out of range. <code>clampToInt64</code> handles NaN and positive overflow correctly.</li>
 <li><strong>Register the backend name</strong> in <code>sim/bundle.go</code>: add <code>"your-backend": true</code> to <code>validLatencyBackends</code> map.</li>
-<li><strong>Register in <code>NewLatencyModel</code> factory</strong> in <code>sim/latency/latency.go</code>: add a <code>case</code> branch in the <code>switch hw.Backend</code> block. The backend string (e.g., <code>"trained-roofline"</code>) is set by the <code>--latency-model</code> CLI flag and stored in <code>ModelHardwareConfig.Backend</code>. The factory signature is <code>NewLatencyModel(LatencyCoeffs, ModelHardwareConfig)</code>.</li>
+<li><strong>Register in <code>NewLatencyModel</code> factory</strong> in <code>sim/latency/latency.go</code>: add a <code>case</code> branch in the <code>switch hw.Backend</code> block. The backend string (e.g., <code>"trained-physics"</code>) is set by the <code>--latency-model</code> CLI flag and stored in <code>ModelHardwareConfig.Backend</code>. The factory signature is <code>NewLatencyModel(LatencyCoeffs, ModelHardwareConfig)</code>.</li>
 <li><strong>Add CLI wiring</strong> (if needed) in <code>cmd/root.go</code>: add a loading block for your backend's coefficients from <code>defaults.yaml</code>. If your backend needs a custom defaults section, add a struct to <code>cmd/default_config.go</code>.</li>
 <li><strong>Add behavioral tests</strong> in <code>sim/latency/</code> — monotonicity (more tokens → longer step time), positive output, boundary cases (empty batch)</li>
 <li>Extension friction: <strong>3-5 touch points</strong> (implementation + bundle map + factory branch; optionally CLI wiring + defaults struct)</li>
 </ol>
 <p>Examples:
-- See <code>BlackboxLatencyModel</code> in <code>sim/latency/latency.go</code> for a simple stateless model (alpha/beta regression)
-- See <code>RooflineLatencyModel</code> in <code>sim/latency/latency.go</code> for a model that uses hardware config (FLOPs/bandwidth)
-- See <code>CrossModelLatencyModel</code> in <code>sim/latency/crossmodel.go</code> for a physics-informed model that derives step time from HuggingFace architecture features (MoE-aware)
-- See <code>TrainedRooflineLatencyModel</code> in <code>sim/latency/trained_roofline.go</code> for a data-driven model with roofline basis functions × learned corrections (zero-allocation hot path, 7% MAPE)</p>
+- See <code>RooflineLatencyModel</code> in <code>sim/latency/latency.go</code> for a simple stateless analytical model (FLOPs/bandwidth roofline)
+- See <code>TrainedPhysicsModel</code> in <code>sim/latency/trained_physics_model.go</code> for a physics-informed model with roofline basis functions, learned corrections, and MoE-aware overhead modeling</p>
 <h2 id="adding-new-batch-formation-strategies">Adding New Batch Formation Strategies<a class="headerlink" href="#adding-new-batch-formation-strategies" title="Permanent link">&para;</a></h2>
 <p>To add a new batch formation strategy (e.g., disaggregated prefill/decode, speculative decoding, continuous batching without preemption):</p>
 <ol>
@@ -2478,16 +3018,82 @@
 <li>The implementation MUST update <code>ctx.ComputedTokens[req.ID]</code> for each request that receives new tokens (Phase 2 of <code>Step()</code> reads this map to advance <code>ProgressIndex</code>)</li>
 <li>The implementation may mutate <code>WaitQ</code> (dequeue/prepend) and <code>KVCache</code> (allocate/release) during batch formation</li>
 <li>The implementation MUST NOT schedule events or record metrics — return decisions in <code>BatchResult</code>, the Simulator applies them</li>
-<li><strong>Register in <code>NewBatchFormation</code> factory</strong> in <code>sim/batch_formation.go</code>: add a selection branch. The factory signature is <code>NewBatchFormation()</code> — a future PR will add a strategy selection parameter (e.g., a string field in <code>PolicyConfig</code> or <code>BatchConfig</code>)</li>
+<li><strong>Register in <code>NewBatchFormation</code> factory</strong> in <code>sim/batch_formation.go</code>: add a selection branch. The factory signature is <code>NewBatchFormation(preemptionPolicy string)</code>. For a new batch formation <em>strategy</em> (not just a preemption variant), add a <code>BatchFormation string</code> field to <code>PolicyConfig</code> and a selection branch in <code>NewBatchFormation</code></li>
 <li><strong>Add behavioral tests</strong> — token budget enforcement, batch size limits, KV conservation, preemption behavior (if applicable), FCFS ordering</li>
 <li>Extension friction: <strong>2 touch points</strong> (implementation + factory registration)</li>
 </ol>
-<p><strong>Note:</strong> Currently only <code>VLLMBatchFormation</code> exists. Adding a second strategy will also require: (a) a <code>BatchFormation string</code> field in <code>PolicyConfig</code> or <code>BatchConfig</code> (in <code>sim/config.go</code>), (b) a CLI flag in <code>cmd/root.go</code>, (c) validation in <code>sim/bundle.go</code>, (d) selection logic in <code>NewBatchFormation</code>.</p>
+<p><strong>Note:</strong> Currently only <code>VLLMBatchFormation</code> exists (with configurable preemption via <code>--preemption-policy fcfs|priority</code>). Adding a second batch formation strategy will also require: (a) a <code>BatchFormation string</code> field in <code>PolicyConfig</code> or <code>BatchConfig</code> (in <code>sim/config.go</code>), (b) a CLI flag in <code>cmd/root.go</code>, (c) validation in <code>sim/bundle.go</code>, (d) selection logic in <code>NewBatchFormation</code>. For adding a new <em>preemption</em> variant (not a new strategy), add a constant to <code>batch_formation.go</code>, a case to the <code>switch</code> in <code>preemptForTokens</code>, and an entry in <code>validPreemptionPolicies</code> in <code>bundle.go</code>.</p>
 <p>Examples:
 - See <code>VLLMBatchFormation</code> in <code>sim/batch_formation.go</code> for the vLLM FCFS + chunked-prefill + preemption strategy
 - See <code>preemptForTokens</code> for the KV allocation + eviction loop pattern</p>
+<h2 id="adding-new-quantization-formats">Adding New Quantization Formats<a class="headerlink" href="#adding-new-quantization-formats" title="Permanent link">&para;</a></h2>
+<p>To add support for a new quantization format (e.g., GGUF, HQQ, Marlin):</p>
+<ol>
+<li><strong>Add <code>quantization_config</code> parsing</strong> in <code>sim/latency/config.go</code> inside <code>ParseHuggingFaceConfig()</code>. The three-tier detection order:</li>
+<li><strong>Tier 1 — <code>quantization_config</code></strong>: Add a new <code>else if</code> branch after the existing <code>compressed-tensors</code> case (~line 240). Extract the weight bit-width from the format's config structure and set <code>weightBytesPerParam = bits / 8.0</code>. Use case-insensitive matching for <code>quant_method</code> (<code>strings.EqualFold</code>).</li>
+<li><strong>Tier 2 — Model name conventions</strong>: If the format has recognizable naming patterns (like <code>w4a16</code> or <code>FP8</code>), add a regex to the compiled patterns (<code>reWxAy</code>, <code>reFP8Name</code>) or add a new pattern near line 283. Update <code>InferWeightBytesFromModelName()</code> accordingly.</li>
+<li>
+<p><strong>Tier 3 — <code>torch_dtype</code> fallback</strong>: No changes needed — this is automatic via <code>BytesPerParam</code>.</p>
+</li>
+<li>
+<p><strong>Add tests</strong> in <code>sim/latency/config_test.go</code>:</p>
+</li>
+<li>A <code>TestParseHuggingFaceConfig_YourFormat_*</code> test with a synthetic <code>config.json</code> containing the new <code>quantization_config</code> structure</li>
+<li>Verify <code>WeightBytesPerParam</code> is set correctly</li>
+<li>
+<p>If adding name-based detection, add cases to <code>TestInferWeightBytesFromModelName</code></p>
+</li>
+<li>
+<p><strong>No changes needed to roofline/KV capacity code</strong> — they already use <code>EffectiveWeightBytesPerParam()</code> which automatically picks up the new format's weight precision.</p>
+</li>
+<li>
+<p>Extension friction: <strong>1-2 touch points</strong> (config parsing + optional name regex)</p>
+</li>
+</ol>
+<p>Examples:
+- See the GPTQ/AWQ <code>bits</code> extraction (~line 229) for formats with a top-level <code>bits</code> field
+- See the <code>compressed-tensors</code> branch (~line 240) for formats with nested config structures
+- See <code>InferWeightBytesFromModelName()</code> for regex-based name pattern detection</p>
+<h2 id="adding-a-new-engine">Adding a New Engine<a class="headerlink" href="#adding-a-new-engine" title="Permanent link">&para;</a></h2>
+<p>To add a new autoscaler <code>Engine</code> implementation (e.g., a cost-minimizing MIP solver or an OpenEvolve-evolved policy):</p>
+<ol>
+<li><strong>Implement the <code>Engine</code> interface</strong> in <code>sim/cluster/engine.go</code> (or a new file for complex engines) — 1 method:</li>
+<li><code>Optimize(results []AnalyzerResult, inventory GPUInventory) []ScaleDecision</code></li>
+<li>Inputs: one <code>AnalyzerResult</code> per model (supply/demand signals + per-variant breakdown) and a <code>GPUInventory</code> snapshot (free GPU slots per variant, pre-subtracted for Loading/Active/Draining instances).</li>
+<li>Output: at most one <code>ScaleDecision</code> per model per call. <code>Delta &gt; 0</code> = add replicas; <code>Delta &lt; 0</code> = remove replicas.</li>
+<li>
+<p><strong>Must not</strong> read <code>RouterState</code> or <code>ModelSignals</code> directly — only <code>AnalyzerResult</code>.</p>
+</li>
+<li>
+<p><strong>Reuse the shared helpers</strong> when appropriate:</p>
+</li>
+<li><code>scaleUpN(requiredCapacity float64, vcs []VariantCapacity) int</code> — exact replica count via <code>ceil(requiredCapacity / prc)</code>; fallback to 1 when <code>prc == 0</code>.</li>
+<li><code>scaleDownN(spareCapacity float64, vc VariantCapacity) int</code> — exact replica count via <code>floor(spareCapacity / prc)</code>, clamped to <code>[1, ReplicaCount]</code>; fallback to 1.</li>
+<li><code>sortedByAscCost</code>, <code>sortedByDescCost</code> — deterministic variant sort (R2: copy-and-sort to avoid mutating caller data).</li>
+<li>
+<p>Pass only the selected variant to <code>scaleUpN</code> (<code>vcs[0:1]</code>, not the full slice) so <code>perReplicaCapacityForScaleUp</code> uses the chosen variant's own capacity — not a different active variant's.</p>
+</li>
+<li>
+<p><strong>Wire the engine</strong> in <code>sim/cluster/cluster.go</code> — search for <code>&amp;UnlimitedEngine{}</code> in the autoscaler pipeline construction and replace it with your engine (or add a config field + factory once multi-engine selection is implemented in the follow-up wiring PR).</p>
+</li>
+<li>
+<p><strong>Add behavioral tests</strong> in <code>sim/cluster/engine_test.go</code>:</p>
+</li>
+<li>Scale-up: correct <code>Delta</code>, correct <code>Variant</code>, inventory check pass/fail.</li>
+<li>Scale-down: correct <code>Delta</code> from spare capacity, <code>ReplicaCount</code> clamp.</li>
+<li>Edge cases: zero <code>RequiredCapacity</code>, zero <code>SpareCapacity</code>, all variants inactive, <code>TPDegree &gt; 1</code>.</li>
+<li>
+<p>Cross-model: multiple <code>AnalyzerResult</code> entries — verify decisions for each model independently.</p>
+</li>
+<li>
+<p>Extension friction: <strong>2 touch points</strong> (implementation + wiring via <code>&amp;UnlimitedEngine{}</code> in <code>cluster.go</code>). For research variants behind a config field, 4 touch points: implementation + <code>AutoscalerConfig</code> field + factory function + CLI flag.</p>
+</li>
+</ol>
+<p>Examples:
+- See <code>UnlimitedEngine</code> in <code>sim/cluster/engine.go</code> for a simple inventory-ignoring engine
+- See <code>GreedyEngine</code> in <code>sim/cluster/engine.go</code> for an inventory-respecting greedy engine with exact-N sizing</p>
 <h2 id="adding-new-per-request-metric-fields">Adding New Per-Request Metric Fields<a class="headerlink" href="#adding-new-per-request-metric-fields" title="Permanent link">&para;</a></h2>
-<p>To add a new field to per-request JSON output (appears in <code>--results-path</code> output):</p>
+<p>To add a new field to per-request JSON output (appears in <code>--metrics-path</code> output):</p>
 <ol>
 <li><strong>Add field to <code>Request</code></strong> in <code>sim/request.go</code> (runtime state, zero-value safe). When constructing <code>Request</code> structs, use <code>RequestState</code> typed constants (<code>StateQueued</code>, <code>StateRunning</code>, <code>StateCompleted</code>) — never bare strings.</li>
 <li><strong>Add field to <code>RequestMetrics</code></strong> in <code>sim/metrics_utils.go</code> (JSON output struct, use <code>omitempty</code> for backward compatibility)</li>
@@ -2597,6 +3203,12 @@
     
     
       <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+        <script src="../../javascripts/mermaid-text-fix.js"></script>
+      
+        <script src="../../javascripts/mathjax.js"></script>
+      
+        <script src="https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js"></script>
       
     
   </body>
