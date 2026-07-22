@@ -1778,7 +1778,7 @@ func TestObserveCmd_WorkloadInputGuard_IncludesPreset(t *testing.T) {
 	content := string(data)
 	// The required-input guard message must list all four input modes.
 	// We check for the specific error string text, not just any occurrence of "--workload".
-	wantText := "Either --workload, --workload-spec, --rate, or --concurrency is required"
+	wantText := "Either --workload, --workload-spec, --rate, --concurrency, or --input-trace-header/--input-trace-data is required"
 	if !strings.Contains(content, wantText) {
 		t.Errorf("required-input guard in observe_cmd.go must contain:\n  %q\nnot found in file", wantText)
 	}

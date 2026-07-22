@@ -65,6 +65,12 @@ var (
 	observeTimeout             int
 	observePrewarmDuration     time.Duration
 	observeLazyGeneration      bool // --lazy-generation: stream requests from generator (alpha, #1441/#1443)
+	// Trace-input path (closed-loop replay of a recorded TraceV2 against the real
+	// server). Distinct from the OUTPUT --trace-header/--trace-data above.
+	observeInputTraceHeader   string
+	observeInputTraceData     string
+	observeConcurrentSessions int
+	observeTotalSessions      int
 	// saturationReport is declared in root.go and shared across run, replay, observe
 )
 
@@ -82,6 +88,13 @@ Supports --workload-spec (YAML), --workload <preset> (named preset; requires --r
 --rate (distribution synthesis), or --concurrency (closed-loop virtual users) input paths.
 Closed-loop sessions with multi-turn follow-ups are supported when the WorkloadSpec
 contains session clients.
+
+Trace-input path: --input-trace-header/--input-trace-data drive the exact requests of
+a recorded TraceV2 corpus, closed-loop, with a fixed pool of --concurrent-sessions
+sessions (--total-sessions duplicates the corpus with cache-busting to fill). This is
+the closed-loop fixed-pool semantics of 'blis replay', but against a real server. It is
+mutually exclusive with --workload-spec/--workload/--rate/--concurrency. These INPUT
+flags are distinct from the OUTPUT --trace-header/--trace-data.
 
 API format: Use --api-format=chat for servers that expose /v1/chat/completions
 (most production vLLM/SGLang deployments). Default is --api-format=completions
@@ -109,7 +122,12 @@ Example:
 
   blis observe --server-url http://localhost:8000 --model meta-llama/Llama-3.1-8B-Instruct \
     --api-format chat --concurrency 50 --num-requests 500 --think-time-ms 200 \
-    --trace-header trace.yaml --trace-data trace.csv`,
+    --trace-header trace.yaml --trace-data trace.csv
+
+  blis observe --server-url http://localhost:8000 --model meta-llama/Llama-3.1-8B-Instruct \
+    --input-trace-header corpus.yaml --input-trace-data corpus.csv \
+    --concurrent-sessions 8 --total-sessions 200 \
+    --trace-header out.yaml --trace-data out.csv`,
 	Run: runObserve,
 }
 
@@ -125,6 +143,15 @@ func init() {
 	observeCmd.Flags().StringVar(&observeWorkload, "workload", "", "Workload preset name (chatbot, summarization, contentgen, multidoc); requires --rate")
 	observeCmd.Flags().StringVar(&observeDefaultsFilePath, "defaults-filepath", "defaults.yaml", "Path to defaults.yaml (for preset workload definitions)")
 	observeCmd.Flags().Float64Var(&observeRate, "rate", 0, "Requests per second for distribution synthesis")
+
+	// Trace-input path (closed-loop replay of a recorded TraceV2 corpus against
+	// the real server). These INPUT flags are distinct from the OUTPUT
+	// --trace-header/--trace-data and are mutually exclusive with the synthesized
+	// workload inputs (--workload-spec/--workload/--rate/--concurrency).
+	observeCmd.Flags().StringVar(&observeInputTraceHeader, "input-trace-header", "", "Input TraceV2 header YAML to drive closed-loop replay against the real server (trace-input path). Both --input-trace-header and --input-trace-data are required together; mutually exclusive with --workload-spec/--workload/--rate/--concurrency. Distinct from the output --trace-header.")
+	observeCmd.Flags().StringVar(&observeInputTraceData, "input-trace-data", "", "Input TraceV2 data CSV (trace-input path). Both --input-trace-header and --input-trace-data are required together.")
+	observeCmd.Flags().IntVar(&observeConcurrentSessions, "concurrent-sessions", 0, "Trace-input path: number of concurrently-active closed-loop sessions drawn from the input trace corpus (must be >= 1 when the trace path is used).")
+	observeCmd.Flags().IntVar(&observeTotalSessions, "total-sessions", 0, "Trace-input path: total sessions to replay; duplicates the corpus (with cache-busting) to fill. 0 = replay each corpus session once. Requires the trace-input path.")
 	observeCmd.Flags().BoolVar(&observeLazyGeneration, "lazy-generation", false,
 		"Alpha (#1441): stream requests from the workload generator instead of pre-generating "+
 			"the full slice. Default off. Supports every workload class — single-shot, single- and "+
@@ -210,6 +237,48 @@ func validateObserveWorkloadFlags(preset, workloadSpec string, rateChanged bool,
 	return ""
 }
 
+// validateObserveTraceInputFlags checks the trace-input path's flag constraints.
+// Returns (engaged, errMsg): engaged is true when the trace path is in use
+// (both input-trace flags present); errMsg is non-empty when the flag
+// combination is invalid, empty when valid. Extracted for unit testability (R14).
+//
+// Rules:
+//   - --input-trace-header and --input-trace-data are both-or-neither.
+//   - When engaged, the trace path is mutually exclusive with the synthesized
+//     workload inputs (--workload-spec/--workload/--rate/--concurrency),
+//     --concurrent-sessions must be >= 1, and --total-sessions must be >= 0.
+//   - When NOT engaged, --concurrent-sessions/--total-sessions must not be set
+//     (they only apply to the trace path).
+func validateObserveTraceInputFlags(
+	inputHeader, inputData, workloadSpec, preset string,
+	rateChanged bool, concurrency, concurrentSessions, totalSessions int,
+	concurrentSessionsChanged, totalSessionsChanged bool,
+) (engaged bool, errMsg string) {
+	if (inputHeader == "") != (inputData == "") {
+		return false, "--input-trace-header and --input-trace-data must be provided together"
+	}
+	engaged = inputHeader != "" && inputData != ""
+	if engaged {
+		if workloadSpec != "" || preset != "" || rateChanged || concurrency > 0 {
+			return true, "--input-trace-header/--input-trace-data (trace-input path) are mutually exclusive with --workload-spec, --workload, --rate, and --concurrency"
+		}
+		if concurrentSessions < 1 {
+			return true, fmt.Sprintf("--concurrent-sessions must be >= 1 when using the trace-input path, got %d", concurrentSessions)
+		}
+		if totalSessions < 0 {
+			return true, fmt.Sprintf("--total-sessions must be >= 0, got %d", totalSessions)
+		}
+		return true, ""
+	}
+	if concurrentSessionsChanged {
+		return false, "--concurrent-sessions requires the trace-input path (--input-trace-header and --input-trace-data)"
+	}
+	if totalSessionsChanged {
+		return false, "--total-sessions requires the trace-input path (--input-trace-header and --input-trace-data)"
+	}
+	return false, ""
+}
+
 // validateITLStreamingFlags rejects the incoherent --record-itl + --no-streaming
 // combination. ITL recording captures per-chunk timestamps, which only exist for
 // streaming responses; with --no-streaming the per-request streaming override in
@@ -279,9 +348,21 @@ func runObserve(cmd *cobra.Command, _ []string) {
 	if msg := validateITLStreamingFlags(observeRecordITL, observeNoStreaming); msg != "" {
 		logrus.Fatalf("%s", msg)
 	}
+	// Trace-input path validation (closed-loop replay of a recorded corpus).
+	// Runs before BC-7 so the required-input guard can accept the trace path,
+	// and before the preset/rate/concurrency checks so a clearer trace-specific
+	// error is shown first when the trace path is combined with those inputs.
+	traceInputEngaged, traceMsg := validateObserveTraceInputFlags(
+		observeInputTraceHeader, observeInputTraceData, observeWorkloadSpec, observeWorkload,
+		cmd.Flags().Changed("rate"), observeConcurrency, observeConcurrentSessions, observeTotalSessions,
+		cmd.Flags().Changed("concurrent-sessions"), cmd.Flags().Changed("total-sessions"))
+	if traceMsg != "" {
+		logrus.Fatalf("%s", traceMsg)
+	}
+
 	// BC-7: at least one workload input mode must be provided
-	if observeWorkload == "" && observeWorkloadSpec == "" && !cmd.Flags().Changed("rate") && observeConcurrency <= 0 {
-		logrus.Fatalf("Either --workload, --workload-spec, --rate, or --concurrency is required")
+	if observeWorkload == "" && observeWorkloadSpec == "" && !cmd.Flags().Changed("rate") && observeConcurrency <= 0 && !traceInputEngaged {
+		logrus.Fatalf("Either --workload, --workload-spec, --rate, --concurrency, or --input-trace-header/--input-trace-data is required")
 	}
 	// BC-2/3/4: preset-mode constraint check (extracted for testability, R14).
 	// Runs before the existing concurrency/rate exclusion so preset errors are shown first.
@@ -301,8 +382,8 @@ func runObserve(cmd *cobra.Command, _ []string) {
 	if cmd.Flags().Changed("think-time-ms") && cmd.Flags().Changed("think-time-dist") {
 		logrus.Fatalf("--think-time-ms and --think-time-dist are mutually exclusive")
 	}
-	if observeThinkTimeDist != "" && observeConcurrency <= 0 {
-		logrus.Fatalf("--think-time-dist requires --concurrency")
+	if observeThinkTimeDist != "" && observeConcurrency <= 0 && !traceInputEngaged {
+		logrus.Fatalf("--think-time-dist requires --concurrency or the trace-input path")
 	}
 
 	// Resolve think-time distribution sampler (nil when --think-time-dist is not set;
@@ -339,128 +420,179 @@ func runObserve(cmd *cobra.Command, _ []string) {
 		logrus.Fatalf("--timeout must be between 1 and 86400 seconds (1 day), got %d", observeTimeout)
 	}
 
-	// Generate workload
-	var spec *workload.WorkloadSpec
-	if observeWorkloadSpec != "" {
-		if observeConcurrency > 0 {
-			logrus.Fatalf("--concurrency cannot be used with --workload-spec; " +
-				"define concurrency in the spec file using clients[].concurrency instead")
-		}
-		var err error
-		spec, err = workload.LoadWorkloadSpec(observeWorkloadSpec)
-		if err != nil {
-			logrus.Fatalf("Failed to load workload spec: %v", err)
-		}
-		if cmd.Flags().Changed("seed") {
-			spec.Seed = observeSeed
-		}
-	} else if observeWorkload != "" {
-		// Preset synthesis — BC-1: same token distribution as blis run --workload <preset>
-		// Rate was validated finite+positive by the earlier rate validation above (defense-in-depth:
-		// also guarded by validateObserveWorkloadFlags above, which requires rateChanged to be true).
-		// Use separate errMsg var + = (not :=) to avoid shadowing the outer spec variable.
-		var errMsg string
-		spec, errMsg = buildPresetSpec(observeWorkload, observeDefaultsFilePath, observeRate, observeNumRequests)
-		if errMsg != "" {
-			logrus.Fatalf("%s", errMsg)
-		}
-		spec.Seed = observeSeed
-	} else {
-		// Distribution or concurrency synthesis
-		// R3: Validate distribution token bounds before synthesis.
-		if msg := validateDistributionParams(observePromptMin, observePromptMax, observeOutputMin, observeOutputMax,
-			observePromptStdDev, observeOutputStdDev, observePromptTokens, observeOutputTokens); msg != "" {
-			logrus.Fatalf("%s", msg)
-		}
-		spec = workload.SynthesizeFromDistribution(workload.DistributionParams{
-			Rate:               observeRate,
-			Concurrency:        observeConcurrency,
-			ThinkTimeMs:        observeThinkTimeMs,
-			NumRequests:        observeNumRequests,
-			PrefixTokens:       observePrefixTokens,
-			PromptTokensMean:   observePromptTokens,
-			PromptTokensStdDev: observePromptStdDev,
-			PromptTokensMin:    observePromptMin,
-			PromptTokensMax:    observePromptMax,
-			OutputTokensMean:   observeOutputTokens,
-			OutputTokensStdDev: observeOutputStdDev,
-			OutputTokensMin:    observeOutputMin,
-			OutputTokensMax:    observeOutputMax,
-		})
-		spec.Seed = observeSeed
-	}
-
-	// Resolve horizon
-	horizon := int64(math.MaxInt64)
-	if cmd.Flags().Changed("horizon") && observeHorizon > 0 {
-		horizon = observeHorizon
-	} else if spec.Horizon > 0 {
-		horizon = spec.Horizon
-	}
-
-	// Resolve max requests
-	maxRequests := spec.NumRequests
-	if cmd.Flags().Changed("num-requests") && observeNumRequests > 0 {
-		maxRequests = int64(observeNumRequests)
-	}
-
-	// Guard unbounded generation
-	if maxRequests <= 0 && horizon == math.MaxInt64 {
-		logrus.Fatalf("Workload requires either num_requests, --num-requests, or --horizon to bound generation")
-	}
-
-	// Generate requests and session blueprints (BC-1, BC-2, D1).
-	//
-	// Lazy generation path (#1441/#1443, alpha, default off). When set, build a
-	// streaming request source instead of materializing the full slice, mirroring
-	// blis run (cmd/root.go). As of #1460 there is NO eager-fallback class — every
-	// spec the eager generator accepts is streamed: multi-session reasoning (#1458),
-	// concurrency clients (#1459), and time-varying / per-window workloads (#1460).
-	// Any error is a real spec/validation failure → abort.
-	//
-	// No spec pre-expand is needed here (unlike run): observe has no
-	// pre-generation applyTimeoutToSpec step, and both generators expand
-	// spec.Clients in place before the (post-generation) prefix-string loop
-	// reads it.
-	var wl *workload.GeneratedWorkload
+	// Resolve the workload source. Two mutually-exclusive paths:
+	//   - trace-input path (--input-trace-header/--input-trace-data): drive the
+	//     server from a recorded TraceV2 corpus, closed-loop, via a fixed
+	//     SessionPoolDriver. Shares BuildSessionPool with blis replay, so the
+	//     fixed-pool semantics (admission, IDs, order) are identical (INV-13).
+	//   - synthesized path (default): generate requests + session blueprints from
+	//     a WorkloadSpec (existing behavior, unchanged).
+	var spec *workload.WorkloadSpec          // nil on the trace-input path
+	var sessionDriver workload.SessionDriver // *SessionPoolDriver (trace) or *SessionManager (synth)
+	var wl *workload.GeneratedWorkload       // synth path only
+	var initialTraceRequests []*sim.Request  // trace path only: fixed pool's initial round-0 requests
 	// lazySource is typed as the interface satisfied by *workload.lazyRequestSource:
 	// Next() feeds the orchestrator, Err() surfaces a terminal per-client sampler
 	// failure after dispatch so we can Fatalf (matching eager's abort-on-invalid-spec).
+	// nil on the trace-input path.
 	var lazySource interface {
 		Next() (*sim.Request, bool)
 		Err() error
 	}
-	if observeLazyGeneration {
-		src, sessions, followUpBudget, lazyErr := workload.GenerateWorkloadLazy(spec, horizon, maxRequests)
-		if lazyErr != nil {
-			logrus.Fatalf("Failed to build lazy workload: %v", lazyErr)
+	horizon := int64(math.MaxInt64)
+
+	if traceInputEngaged {
+		// Trace-input path: default to an unbounded, self-draining horizon (the
+		// pool drains on session count, not wall-clock); --horizon caps it. Mirrors
+		// blis replay's pool-mode horizon handling.
+		if cmd.Flags().Changed("horizon") && observeHorizon > 0 {
+			horizon = observeHorizon
 		}
-		lazySource = src
-		wl = &workload.GeneratedWorkload{Sessions: sessions, FollowUpBudget: followUpBudget}
-	}
-	if wl == nil {
-		var err error
-		wl, err = workload.GenerateWorkload(spec, horizon, maxRequests)
+		// Effective per-round think-time sampler: --think-time-dist (resolved
+		// above) takes precedence; --think-time-ms maps to a constant sampler;
+		// neither → per-round gaps derived from the trace inside
+		// LoadTraceV2SessionBlueprints. Mirrors blis replay (cmd/replay.go).
+		traceThinkSampler := observeThinkTimeSampler
+		if traceThinkSampler == nil && cmd.Flags().Changed("think-time-ms") && observeThinkTimeMs > 0 {
+			var tErr error
+			traceThinkSampler, tErr = workload.ParseThinkTimeDist(fmt.Sprintf("constant:value=%dms", observeThinkTimeMs))
+			if tErr != nil {
+				logrus.Fatalf("--think-time-ms: %v", tErr)
+			}
+		}
+		trace, err := workload.LoadTraceV2(observeInputTraceHeader, observeInputTraceData)
 		if err != nil {
-			logrus.Fatalf("Failed to generate workload: %v", err)
+			logrus.Fatalf("Failed to load input trace: %v", err)
 		}
-	}
-
-	if lazySource != nil {
-		logrus.Infof("Generated streaming workload source (lazy, #1441)")
+		r0Requests, blueprints, bErr := workload.LoadTraceV2SessionBlueprints(trace, observeSeed, traceThinkSampler, horizon)
+		if bErr != nil {
+			logrus.Fatalf("Failed to build session blueprints from input trace: %v", bErr)
+		}
+		if len(blueprints) == 0 {
+			logrus.Fatalf("--input-trace-header/--input-trace-data: input trace has no session records (session_id column); the trace-input path requires a recorded session corpus")
+		}
+		driver, initialR0, pErr := workload.BuildSessionPool(blueprints, r0Requests, observeConcurrentSessions, observeTotalSessions, observeSeed)
+		if pErr != nil {
+			logrus.Fatalf("Failed to build session pool: %v", pErr)
+		}
+		sessionDriver = driver
+		initialTraceRequests = initialR0
+		logrus.Infof("Trace-input pool: concurrent=%d total=%d, %d round-0 requests injected initially",
+			observeConcurrentSessions, driver.TotalSessions(), len(initialR0))
 	} else {
-		logrus.Infof("Generated %d requests", len(wl.Requests))
-	}
-	if len(wl.Sessions) > 0 {
-		logrus.Infof("Generated %d session blueprints (closed-loop)", len(wl.Sessions))
-	}
+		// Synthesized-workload path (existing behavior).
+		if observeWorkloadSpec != "" {
+			if observeConcurrency > 0 {
+				logrus.Fatalf("--concurrency cannot be used with --workload-spec; " +
+					"define concurrency in the spec file using clients[].concurrency instead")
+			}
+			var err error
+			spec, err = workload.LoadWorkloadSpec(observeWorkloadSpec)
+			if err != nil {
+				logrus.Fatalf("Failed to load workload spec: %v", err)
+			}
+			if cmd.Flags().Changed("seed") {
+				spec.Seed = observeSeed
+			}
+		} else if observeWorkload != "" {
+			// Preset synthesis — BC-1: same token distribution as blis run --workload <preset>
+			// Rate was validated finite+positive by the earlier rate validation above (defense-in-depth:
+			// also guarded by validateObserveWorkloadFlags above, which requires rateChanged to be true).
+			// Use separate errMsg var + = (not :=) to avoid shadowing the outer spec variable.
+			var errMsg string
+			spec, errMsg = buildPresetSpec(observeWorkload, observeDefaultsFilePath, observeRate, observeNumRequests)
+			if errMsg != "" {
+				logrus.Fatalf("%s", errMsg)
+			}
+			spec.Seed = observeSeed
+		} else {
+			// Distribution or concurrency synthesis
+			// R3: Validate distribution token bounds before synthesis.
+			if msg := validateDistributionParams(observePromptMin, observePromptMax, observeOutputMin, observeOutputMax,
+				observePromptStdDev, observeOutputStdDev, observePromptTokens, observeOutputTokens); msg != "" {
+				logrus.Fatalf("%s", msg)
+			}
+			spec = workload.SynthesizeFromDistribution(workload.DistributionParams{
+				Rate:               observeRate,
+				Concurrency:        observeConcurrency,
+				ThinkTimeMs:        observeThinkTimeMs,
+				NumRequests:        observeNumRequests,
+				PrefixTokens:       observePrefixTokens,
+				PromptTokensMean:   observePromptTokens,
+				PromptTokensStdDev: observePromptStdDev,
+				PromptTokensMin:    observePromptMin,
+				PromptTokensMax:    observePromptMax,
+				OutputTokensMean:   observeOutputTokens,
+				OutputTokensStdDev: observeOutputStdDev,
+				OutputTokensMin:    observeOutputMin,
+				OutputTokensMax:    observeOutputMax,
+			})
+			spec.Seed = observeSeed
+		}
 
-	// Apply --think-time-dist sampler to all session blueprints (overrides constant ThinkTimeUs).
-	applyThinkTimeSampler(wl.Sessions, observeThinkTimeSampler)
+		// Resolve horizon
+		if cmd.Flags().Changed("horizon") && observeHorizon > 0 {
+			horizon = observeHorizon
+		} else if spec.Horizon > 0 {
+			horizon = spec.Horizon
+		}
 
-	// wl.Requests is nil in lazy mode; the empty-trace warning only applies to eager.
-	if lazySource == nil && len(wl.Requests) == 0 {
-		logrus.Warn("No requests generated — writing empty trace")
+		// Resolve max requests
+		maxRequests := spec.NumRequests
+		if cmd.Flags().Changed("num-requests") && observeNumRequests > 0 {
+			maxRequests = int64(observeNumRequests)
+		}
+
+		// Guard unbounded generation
+		if maxRequests <= 0 && horizon == math.MaxInt64 {
+			logrus.Fatalf("Workload requires either num_requests, --num-requests, or --horizon to bound generation")
+		}
+
+		// Generate requests and session blueprints (BC-1, BC-2, D1).
+		//
+		// Lazy generation path (#1441/#1443, alpha, default off). When set, build a
+		// streaming request source instead of materializing the full slice, mirroring
+		// blis run (cmd/root.go). As of #1460 there is NO eager-fallback class — every
+		// spec the eager generator accepts is streamed: multi-session reasoning (#1458),
+		// concurrency clients (#1459), and time-varying / per-window workloads (#1460).
+		// Any error is a real spec/validation failure → abort.
+		//
+		// No spec pre-expand is needed here (unlike run): observe has no
+		// pre-generation applyTimeoutToSpec step, and both generators expand
+		// spec.Clients in place before the (post-generation) prefix-string loop
+		// reads it.
+		if observeLazyGeneration {
+			src, sessions, followUpBudget, lazyErr := workload.GenerateWorkloadLazy(spec, horizon, maxRequests)
+			if lazyErr != nil {
+				logrus.Fatalf("Failed to build lazy workload: %v", lazyErr)
+			}
+			lazySource = src
+			wl = &workload.GeneratedWorkload{Sessions: sessions, FollowUpBudget: followUpBudget}
+		}
+		if wl == nil {
+			var err error
+			wl, err = workload.GenerateWorkload(spec, horizon, maxRequests)
+			if err != nil {
+				logrus.Fatalf("Failed to generate workload: %v", err)
+			}
+		}
+
+		if lazySource != nil {
+			logrus.Infof("Generated streaming workload source (lazy, #1441)")
+		} else {
+			logrus.Infof("Generated %d requests", len(wl.Requests))
+		}
+		if len(wl.Sessions) > 0 {
+			logrus.Infof("Generated %d session blueprints (closed-loop)", len(wl.Sessions))
+		}
+
+		// Apply --think-time-dist sampler to all session blueprints (overrides constant ThinkTimeUs).
+		applyThinkTimeSampler(wl.Sessions, observeThinkTimeSampler)
+
+		// wl.Requests is nil in lazy mode; the empty-trace warning only applies to eager.
+		if lazySource == nil && len(wl.Requests) == 0 {
+			logrus.Warn("No requests generated — writing empty trace")
+		}
 	}
 
 	// NOTE: the former eager ITL streaming-on pre-pass over wl.Requests is
@@ -501,18 +633,28 @@ func runObserve(cmd *cobra.Command, _ []string) {
 		}
 	}
 
-	var sessionMgr *workload.SessionManager
-	if len(wl.Sessions) > 0 {
-		sessionMgr = workload.NewSessionManager(wl.Sessions)
+	// Build the session engine for the synthesized path. The trace-input path
+	// already set sessionDriver to its *SessionPoolDriver above.
+	if !traceInputEngaged && len(wl.Sessions) > 0 {
+		sessionMgr := workload.NewSessionManager(wl.Sessions)
 		if wl.FollowUpBudget >= 0 {
 			sessionMgr.SetFollowUpBudget(wl.FollowUpBudget)
 		}
+		sessionDriver = sessionMgr
 	}
 
 	// Auto-set max-concurrency for concurrency mode
 	if observeConcurrency > 0 && !cmd.Flags().Changed("max-concurrency") {
 		observeMaxConcur = observeConcurrency
 		logrus.Infof("Auto-setting --max-concurrency=%d to match --concurrency", observeConcurrency)
+	}
+	// Auto-set max-concurrency to the pool size for the trace-input path: a
+	// closed-loop pool never has more than --concurrent-sessions requests in
+	// flight, so a smaller default max-concurrency would artificially serialize
+	// the pool and distort measured latency. Mirrors the --concurrency auto-set.
+	if traceInputEngaged && !cmd.Flags().Changed("max-concurrency") && observeConcurrentSessions > observeMaxConcur {
+		observeMaxConcur = observeConcurrentSessions
+		logrus.Infof("Auto-setting --max-concurrency=%d to match --concurrent-sessions", observeConcurrentSessions)
 	}
 
 	// Context for graceful shutdown (BC-12)
@@ -531,11 +673,16 @@ func runObserve(cmd *cobra.Command, _ []string) {
 		runPrewarm(ctx, client, observePrewarmDuration)
 	}
 
-	// RequestSource: streaming in lazy mode, eager-slice adapter otherwise.
-	// The workload package's lazy source satisfies cluster.RequestSource via
-	// structural typing (same Next() method), mirroring blis run.
+	// RequestSource selection:
+	//   - trace-input path: eager-slice adapter over the pool's initial round-0
+	//     requests; follow-ups arrive via the SessionPoolDriver.
+	//   - synthesized path: streaming source in lazy mode, eager-slice adapter
+	//     otherwise. The lazy source satisfies cluster.RequestSource via
+	//     structural typing (same Next() method), mirroring blis run.
 	var observeSource cluster.RequestSource
-	if lazySource != nil {
+	if traceInputEngaged {
+		observeSource = cluster.NewSliceRequestSource(initialTraceRequests)
+	} else if lazySource != nil {
 		observeSource = lazySource
 	} else {
 		observeSource = cluster.NewSliceRequestSource(wl.Requests)
@@ -543,7 +690,7 @@ func runObserve(cmd *cobra.Command, _ []string) {
 
 	// Run orchestrator
 	startTime := time.Now()
-	runObserveOrchestrator(ctx, client, recorder, sessionMgr, observeSource, observeNoStreaming, observeMaxConcur, observeWarmup, prefixes, prefixLengths, observeUnconstrainedOutput, observeRecordITL, tokensPerWord)
+	runObserveOrchestrator(ctx, client, recorder, sessionDriver, observeSource, observeNoStreaming, observeMaxConcur, observeWarmup, prefixes, prefixLengths, observeUnconstrainedOutput, observeRecordITL, tokensPerWord)
 	logrus.Infof("Observation wall-clock time: %.3fs", time.Since(startTime).Seconds())
 
 	// Surface any terminal sampler/generator error the lazy source recorded on a
@@ -590,9 +737,16 @@ func runObserve(cmd *cobra.Command, _ []string) {
 		header.WorkloadSpec = observeWorkloadSpec
 	} else if observeWorkload != "" {
 		header.WorkloadSpec = "preset:" + observeWorkload
+	} else if traceInputEngaged {
+		header.WorkloadSpec = "input-trace:" + observeInputTraceHeader
 	}
 	if spec != nil {
 		header.WorkloadSeed = &spec.Seed
+	} else if traceInputEngaged {
+		// spec is nil on the trace-input path; record the seed used for pool
+		// construction (cache-busting) so downstream tools see provenance.
+		seed := observeSeed
+		header.WorkloadSeed = &seed
 	}
 
 	if err := recorder.Export(header, observeTraceHeader, observeTraceData); err != nil {
@@ -960,7 +1114,7 @@ func runObserveOrchestrator(
 	ctx context.Context,
 	client *RealClient,
 	recorder *Recorder,
-	sessionMgr *workload.SessionManager,
+	sessionDriver workload.SessionDriver,
 	source cluster.RequestSource,
 	noStreaming bool,
 	maxConcurrency int,
@@ -991,19 +1145,19 @@ func runObserveOrchestrator(
 	// they cannot double-count.
 	activeSessionCount := int64(0)
 	var seenSessions map[string]bool
-	if sessionMgr != nil {
+	if sessionDriver != nil {
 		seenSessions = make(map[string]bool)
 	}
 
 	// Session serializer goroutine (BC-8: single-threaded OnComplete)
 	var serializerDone chan struct{}
-	if sessionMgr != nil {
+	if sessionDriver != nil {
 		serializerDone = make(chan struct{})
 		go func() {
 			defer close(serializerDone)
 			for ce := range completionCh {
 				adapted := adaptForSessionManager(ce.req, ce.record)
-				followUps := sessionMgr.OnComplete(adapted, ce.wallClock)
+				followUps := sessionDriver.OnComplete(adapted, ce.wallClock)
 				for _, fu := range followUps {
 					followUpCh <- fu
 				}
@@ -1043,7 +1197,7 @@ func runObserveOrchestrator(
 		}
 
 		// Session completion (BC-3)
-		if sessionMgr != nil && req.SessionID != "" {
+		if sessionDriver != nil && req.SessionID != "" {
 			completionCh <- completionEvent{
 				req:       req,
 				record:    record,
@@ -1076,7 +1230,7 @@ func runObserveOrchestrator(
 	// deref of req.SessionID below assumes a buffered request is present.
 	takePreGen := func() *sim.Request {
 		req := nextPreGen
-		if sessionMgr != nil && req.SessionID != "" && !seenSessions[req.SessionID] {
+		if sessionDriver != nil && req.SessionID != "" && !seenSessions[req.SessionID] {
 			seenSessions[req.SessionID] = true
 			atomic.AddInt64(&activeSessionCount, 1)
 		}
@@ -1126,7 +1280,7 @@ func runObserveOrchestrator(
 			nextReq = pendingFollowUps[0]
 			pendingFollowUps = pendingFollowUps[1:]
 
-		} else if sessionMgr != nil && atomic.LoadInt64(&activeSessionCount) > 0 {
+		} else if sessionDriver != nil && atomic.LoadInt64(&activeSessionCount) > 0 {
 			// No pre-generated or buffered follow-ups — wait for new follow-up or drain
 			select {
 			case fu, ok := <-followUpCh:
@@ -1184,7 +1338,7 @@ drain:
 	wg.Wait()
 
 	// Close session channels
-	if sessionMgr != nil {
+	if sessionDriver != nil {
 		close(completionCh)
 		<-serializerDone
 	}

@@ -166,6 +166,13 @@ func (d *SessionPoolDriver) OnComplete(req *sim.Request, tick int64) []*sim.Requ
 	return nil
 }
 
+// SetFollowUpBudget is a deliberate no-op. The fixed pool is bounded by the
+// number of round-0 requests queued at construction (--total-sessions), not by a
+// separate global follow-up budget, and intra-session follow-ups are governed by
+// each blueprint's MaxRounds via the wrapped SessionManager. This method exists
+// solely so *SessionPoolDriver satisfies workload.SessionDriver.
+func (d *SessionPoolDriver) SetFollowUpBudget(int64) {}
+
 // TotalSessions returns the total number of sessions in the pool (after duplication).
 func (d *SessionPoolDriver) TotalSessions() int { return d.totalCount }
 
