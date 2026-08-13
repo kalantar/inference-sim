@@ -129,6 +129,7 @@ type RequestRecord struct {
 	Status            string // "ok", "error", "timeout"
 	ErrorMessage      string
 	XRequestID        string // client-generated UUID sent as x-request-id header (issue #1428)
+	UpstreamRequestID string // id the model server assigned, recovered from the response (OpenAI object prefix stripped); empty when no response body was read
 	SendTimeUs        int64
 	FirstChunkTimeUs  int64
 	LastChunkTimeUs   int64
@@ -298,6 +299,38 @@ func (c *RealClient) Send(ctx context.Context, req *PendingRequest) (*RequestRec
 	return c.handleNonStreamingResponse(resp, record, req.MinTokens, effectiveMax)
 }
 
+// serverRequestIDPrefixes are the OpenAI object prefixes vLLM prepends to the
+// request id it received: "chatcmpl-" for /v1/chat/completions, "cmpl-" for
+// /v1/completions. Ordered longest-first because "chatcmpl-" also ends in
+// "cmpl-", so a shortest-first scan would mis-strip chat ids.
+var serverRequestIDPrefixes = []string{"chatcmpl-", "cmpl-"}
+
+// stripServerRequestIDPrefix returns the bare request id the model server was
+// given, so the recorded value joins directly against the router's
+// x-request-id with no post-processing.
+//
+// An id carrying no recognized prefix is returned unchanged: a server that
+// names its ids differently should yield a value that is merely unjoinable,
+// never one that is silently truncated.
+func stripServerRequestIDPrefix(id string) string {
+	for _, prefix := range serverRequestIDPrefixes {
+		if strings.HasPrefix(id, prefix) {
+			return strings.TrimPrefix(id, prefix)
+		}
+	}
+	return id
+}
+
+// extractUpstreamRequestID reads the response's `id` field and returns it with
+// the object prefix stripped. Returns "" when absent or not a string.
+func extractUpstreamRequestID(body map[string]interface{}) string {
+	id, ok := body["id"].(string)
+	if !ok || id == "" {
+		return ""
+	}
+	return stripServerRequestIDPrefix(id)
+}
+
 // warnOnFinishReason emits diagnostic warnings for notable finish_reason values.
 // It suppresses the "length" truncation warning in exact-length mode (min_tokens >= max_tokens),
 // always warns on "abort" (server-side error regardless of intent), and warns when
@@ -363,6 +396,10 @@ func (c *RealClient) handleNonStreamingResponse(resp *http.Response, record *Req
 		return record, nil
 	}
 
+	// Capture the id the server assigned: our join key to router routing logs
+	// when the gateway rewrote the x-request-id we sent.
+	record.UpstreamRequestID = extractUpstreamRequestID(result)
+
 	// Extract token counts from usage
 	if usage, ok := result["usage"].(map[string]interface{}); ok {
 		if ct, ok := usage["completion_tokens"].(float64); ok {
@@ -420,6 +457,11 @@ func (c *RealClient) handleStreamingResponse(resp *http.Response, record *Reques
 		}
 		if usage, ok := chunk["usage"].(map[string]interface{}); ok {
 			lastUsage = usage
+		}
+		// Every chunk repeats the same id; keep the first one seen. Chunks
+		// before it may omit the field entirely, so this cannot stop at chunk 1.
+		if record.UpstreamRequestID == "" {
+			record.UpstreamRequestID = extractUpstreamRequestID(chunk)
 		}
 		// Extract finish_reason from content chunks (skip usage-only chunks with empty choices)
 		if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
@@ -506,6 +548,7 @@ func (r *Recorder) RecordRequest(pending *PendingRequest, result *RequestRecord,
 		ErrorMessage:      result.ErrorMessage,
 		FinishReason:      result.FinishReason,
 		XRequestID:        result.XRequestID,
+		UpstreamRequestID: result.UpstreamRequestID,
 		SessionID:         sessionID,
 		RoundIndex:        roundIndex,
 	})

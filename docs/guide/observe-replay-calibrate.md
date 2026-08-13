@@ -173,6 +173,14 @@ Used when `--rate` or `--concurrency` mode is active (ignored when `--workload-s
 !!! info "Streaming and token counts"
     By default, observe uses streaming (SSE) and sends `stream_options: {include_usage: true}` to capture accurate token counts from the final SSE chunk. Non-streaming mode (`--no-streaming`) parses the full response body instead. Both modes extract `finish_reason` from server responses.
 
+!!! info "Correlating requests with routing decisions"
+    In real mode, `trace_data.csv` can carry two request identifiers, both trailing columns:
+
+    - `x_request_id` — the UUID observe generates per request and sends as the `x-request-id` header. Always recorded, including for requests that error or time out.
+    - `upstream_request_id` — the request id the model server actually used, recovered from the response `id` with the OpenAI object prefix stripped (`chatcmpl-` for chat, `cmpl-` for completions). Empty when no response body was read.
+
+    The second column exists because a gateway proxy owns the `x-request-id` header: Envoy regenerates it for requests arriving from outside its trust boundary, so the UUID observe sent is not the id the router logged. vLLM derives its request id from whatever `x-request-id` reached it and echoes it back in the response, so `upstream_request_id` joins directly against the router's routing logs — and from there to the serving pod and its GPUs — without depending on the proxy preserving the client's header. An id from a server that uses some other naming scheme is recorded verbatim rather than truncated.
+
 !!! info "Prefix sharing"
     When the workload spec defines prefix groups, observe builds deterministic prefix strings from a fixed vocabulary, seeded by the RNG seed and group name. This activates the server's prefix cache for realistic KV cache hit rates.
 

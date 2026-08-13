@@ -94,6 +94,7 @@ type TraceRecord struct {
 	ErrorMessage      string
 	FinishReason      string // server-reported finish_reason ("stop", "length", "abort", etc.); empty = not recorded
 	XRequestID        string // client-generated UUID sent as x-request-id header (real-mode only); empty = not recorded
+	UpstreamRequestID string // request id the model server assigned, prefix-stripped (real-mode only); joins to router routing logs when the gateway rewrites x-request-id; empty = not recorded
 }
 
 // TraceV2 combines header and records for a complete trace.
@@ -157,6 +158,20 @@ func ExportTraceV2(header *TraceHeader, records []TraceRecord, headerPath, dataP
 		}
 	}
 
+	// Conditionally include upstream_request_id column: the id the model server
+	// assigned, which is the id the router logged even when the gateway
+	// rewrote the client's x-request-id. Mode-gated for the same reason as
+	// x_request_id — a replay re-export's ids match no real routing decision.
+	includeUpstreamRequestID := false
+	if header.Mode == "real" {
+		for _, r := range records {
+			if r.UpstreamRequestID != "" {
+				includeUpstreamRequestID = true
+				break
+			}
+		}
+	}
+
 	// Conditionally include vllm_priority column: present iff priority was actually computed.
 	// Include when either:
 	// 1. Any record has non-zero priority (batch, standard, sheddable, background from observe)
@@ -185,9 +200,13 @@ func ExportTraceV2(header *TraceHeader, records []TraceRecord, headerPath, dataP
 		}
 	}
 	// Append x_request_id at end (issue #1428): trailing position avoids shifting
-	// indices in the positional parser.
+	// indices in the positional parser. upstream_request_id follows it for the
+	// same reason.
 	if includeXRequestID {
 		columns = append(columns, "x_request_id")
+	}
+	if includeUpstreamRequestID {
+		columns = append(columns, "upstream_request_id")
 	}
 
 	// Write header row
@@ -238,9 +257,12 @@ func ExportTraceV2(header *TraceHeader, records []TraceRecord, headerPath, dataP
 			r.ErrorMessage,
 			r.FinishReason,
 		)
-		// Append x_request_id at end (issue #1428).
+		// Append x_request_id at end (issue #1428), then upstream_request_id.
 		if includeXRequestID {
 			row = append(row, r.XRequestID)
+		}
+		if includeUpstreamRequestID {
+			row = append(row, r.UpstreamRequestID)
 		}
 		if err := writer.Write(row); err != nil {
 			return fmt.Errorf("writing CSV row %d: %w", r.RequestID, err)
@@ -282,7 +304,8 @@ func LoadTraceV2(headerPath, dataPath string) (*TraceV2, error) {
 	// Detect optional columns from header
 	hasVLLMPriority := false
 	hasSLOTarget := false
-	xRequestIDIdx := -1 // header-position lookup; -1 = absent (issue #1428)
+	xRequestIDIdx := -1        // header-position lookup; -1 = absent (issue #1428)
+	upstreamRequestIDIdx := -1 // header-position lookup; -1 = absent
 	for i, col := range headerRow {
 		switch col {
 		case "vllm_priority":
@@ -291,6 +314,8 @@ func LoadTraceV2(headerPath, dataPath string) (*TraceV2, error) {
 			hasSLOTarget = true
 		case "x_request_id":
 			xRequestIDIdx = i
+		case "upstream_request_id":
+			upstreamRequestIDIdx = i
 		}
 	}
 
@@ -313,11 +338,14 @@ func LoadTraceV2(headerPath, dataPath string) (*TraceV2, error) {
 		if xRequestIDIdx >= 0 {
 			minCols++
 		}
+		if upstreamRequestIDIdx >= 0 {
+			minCols++
+		}
 		if len(row) < minCols {
 			return nil, fmt.Errorf("CSV row has %d columns, expected at least %d", len(row), minCols)
 		}
 
-		r, err := parseTraceRecord(row, hasVLLMPriority, hasSLOTarget, xRequestIDIdx)
+		r, err := parseTraceRecord(row, hasVLLMPriority, hasSLOTarget, xRequestIDIdx, upstreamRequestIDIdx)
 		if err != nil {
 			return nil, err
 		}
@@ -328,10 +356,10 @@ func LoadTraceV2(headerPath, dataPath string) (*TraceV2, error) {
 }
 
 // parseTraceRecord parses a CSV row. Handles optional columns vllm_priority
-// (after slo_class), slo_target_us (after deadline_us), and x_request_id
-// (trailing). xRequestIDIdx is the absolute column index in the row, or -1
-// if the column is absent.
-func parseTraceRecord(row []string, hasVLLMPriority, hasSLOTarget bool, xRequestIDIdx int) (*TraceRecord, error) {
+// (after slo_class), slo_target_us (after deadline_us), and the trailing
+// x_request_id and upstream_request_id. xRequestIDIdx and upstreamRequestIDIdx
+// are absolute column indices in the row, or -1 if that column is absent.
+func parseTraceRecord(row []string, hasVLLMPriority, hasSLOTarget bool, xRequestIDIdx, upstreamRequestIDIdx int) (*TraceRecord, error) {
 	// Column offset: optional columns shift subsequent indices.
 	// vllm_priority appears after slo_class (index 3) → shifts everything after by +1.
 	// slo_target_us appears after deadline_us → shifts everything after by +1.
@@ -489,6 +517,12 @@ func parseTraceRecord(row []string, hasVLLMPriority, hasSLOTarget bool, xRequest
 		xRequestID = strings.TrimSpace(row[xRequestIDIdx])
 	}
 
+	// Optional upstream_request_id, looked up the same way.
+	var upstreamRequestID string
+	if upstreamRequestIDIdx >= 0 && upstreamRequestIDIdx < len(row) {
+		upstreamRequestID = strings.TrimSpace(row[upstreamRequestIDIdx])
+	}
+
 	return &TraceRecord{
 		RequestID:         requestID,
 		ClientID:          row[1],
@@ -520,6 +554,7 @@ func parseTraceRecord(row []string, hasVLLMPriority, hasSLOTarget bool, xRequest
 		ErrorMessage:      strings.TrimSpace(row[25+offset]),
 		FinishReason:      finishReason,
 		XRequestID:        xRequestID,
+		UpstreamRequestID: upstreamRequestID,
 	}, nil
 }
 

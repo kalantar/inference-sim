@@ -312,7 +312,7 @@ func TestParseTraceRecord_InvalidInteger_ReturnsError(t *testing.T) {
 	}
 
 	// WHEN parsing
-	_, err := parseTraceRecord(row, false, false, -1)
+	_, err := parseTraceRecord(row, false, false, -1, -1)
 
 	// THEN error about invalid value
 	if err == nil {
@@ -331,7 +331,7 @@ func TestParseTraceRecord_InvalidDeadlineUs_ReturnsError(t *testing.T) {
 	}
 	row[17] = "not_a_number" // deadline_us column (shifted +1 by prefix_length)
 
-	_, err := parseTraceRecord(row, false, false, -1)
+	_, err := parseTraceRecord(row, false, false, -1, -1)
 
 	if err == nil {
 		t.Fatal("expected error for non-numeric deadline_us, got nil")
@@ -349,7 +349,7 @@ func TestParseTraceRecord_InvalidServerInputTokens_ReturnsError(t *testing.T) {
 	}
 	row[18] = "not_a_number" // server_input_tokens column (shifted +1)
 
-	_, err := parseTraceRecord(row, false, false, -1)
+	_, err := parseTraceRecord(row, false, false, -1, -1)
 
 	if err == nil {
 		t.Fatal("expected error for non-numeric server_input_tokens, got nil")
@@ -369,7 +369,7 @@ func TestParseTraceRecord_InvalidVLLMPriority_ReturnsError(t *testing.T) {
 	row[4] = "not_a_number" // vllm_priority column (index 4)
 
 	// WHEN parsing with hasVLLMPriority=true
-	_, err := parseTraceRecord(row, true, false, -1)
+	_, err := parseTraceRecord(row, true, false, -1, -1)
 
 	// THEN error about invalid value
 	if err == nil {
@@ -390,7 +390,7 @@ func TestParseTraceRecord_NegativeVLLMPriority_ReturnsError(t *testing.T) {
 	row[4] = "-1" // negative vllm_priority
 
 	// WHEN parsing with hasVLLMPriority=true
-	_, err := parseTraceRecord(row, true, false, -1)
+	_, err := parseTraceRecord(row, true, false, -1, -1)
 
 	// THEN error about negative value
 	if err == nil {
@@ -412,7 +412,7 @@ func TestParseTraceRecord_NegativeDeadlineUs_ReturnsError(t *testing.T) {
 	}
 	row[17] = "-1" // negative deadline_us (shifted +1)
 
-	_, err := parseTraceRecord(row, false, false, -1)
+	_, err := parseTraceRecord(row, false, false, -1, -1)
 
 	if err == nil {
 		t.Fatal("expected error for negative deadline_us, got nil")
@@ -431,7 +431,7 @@ func TestParseTraceRecord_NegativeInputTokens_ReturnsError(t *testing.T) {
 	}
 	row[9] = "-1" // input_tokens column (shifted +1)
 
-	_, err := parseTraceRecord(row, false, false, -1)
+	_, err := parseTraceRecord(row, false, false, -1, -1)
 
 	if err == nil {
 		t.Fatal("expected error for negative input_tokens, got nil")
@@ -450,7 +450,7 @@ func TestParseTraceRecord_NegativeOutputTokens_ReturnsError(t *testing.T) {
 	}
 	row[10] = "-1" // output_tokens column (shifted +1)
 
-	_, err := parseTraceRecord(row, false, false, -1)
+	_, err := parseTraceRecord(row, false, false, -1, -1)
 
 	if err == nil {
 		t.Fatal("expected error for negative output_tokens, got nil")
@@ -469,7 +469,7 @@ func TestParseTraceRecord_NegativeServerInputTokens_ReturnsError(t *testing.T) {
 	}
 	row[18] = "-1" // server_input_tokens column (shifted +1)
 
-	_, err := parseTraceRecord(row, false, false, -1)
+	_, err := parseTraceRecord(row, false, false, -1, -1)
 
 	if err == nil {
 		t.Fatal("expected error for negative server_input_tokens, got nil")
@@ -489,7 +489,7 @@ func TestParseTraceRecord_DeadlineBeforeArrival_ReturnsError(t *testing.T) {
 	row[17] = "1000" // deadline_us = 1000 (shifted +1)
 	row[19] = "5000" // arrival_time_us = 5000 (shifted +1)
 
-	_, err := parseTraceRecord(row, false, false, -1)
+	_, err := parseTraceRecord(row, false, false, -1, -1)
 
 	if err == nil {
 		t.Fatal("expected error for deadline before arrival, got nil")
@@ -518,7 +518,7 @@ func TestParseTraceRecord_InvalidReasonRatio_ReturnsError(t *testing.T) {
 		}
 		row[15] = tc.value // reason_ratio column (shifted +1)
 
-		_, err := parseTraceRecord(row, false, false, -1)
+		_, err := parseTraceRecord(row, false, false, -1, -1)
 
 		if err == nil {
 			t.Errorf("reason_ratio=%q: expected error, got nil", tc.value)
@@ -1714,5 +1714,176 @@ func TestExportTraceV2_XRequestID_CoexistsWithOtherOptionalColumns(t *testing.T)
 	}
 	if got.XRequestID != "uuid-zzz" {
 		t.Errorf("XRequestID: got %q, want %q", got.XRequestID, "uuid-zzz")
+	}
+}
+
+// TestExportTraceV2_UpstreamRequestID_RoundTrip verifies that
+// upstream_request_id — the id the model server assigned, used to join client
+// rows to router routing logs when the gateway rewrites x-request-id — is
+// preserved through export/load, and is absent when no record carries one.
+func TestExportTraceV2_UpstreamRequestID_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("real mode with ids → column present, values round-trip", func(t *testing.T) {
+		header := &TraceHeader{Version: 2, TimeUnit: "us", Mode: "real"}
+		records := []TraceRecord{
+			{RequestID: 1, InputTokens: 100, OutputTokens: 50, ArrivalTimeUs: 1000, Status: "ok", XRequestID: "uuid-aaa", UpstreamRequestID: "srv-aaa"},
+			{RequestID: 2, InputTokens: 200, OutputTokens: 100, ArrivalTimeUs: 2000, Status: "ok", XRequestID: "uuid-bbb", UpstreamRequestID: "srv-bbb"},
+		}
+
+		headerPath := filepath.Join(dir, "up_header.yaml")
+		dataPath := filepath.Join(dir, "up_data.csv")
+		if err := ExportTraceV2(header, records, headerPath, dataPath); err != nil {
+			t.Fatal(err)
+		}
+
+		data, err := os.ReadFile(dataPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(string(data), "\n")
+		if !strings.Contains(lines[0], "upstream_request_id") {
+			t.Fatalf("expected upstream_request_id in CSV header, got: %s", lines[0])
+		}
+
+		loaded, err := LoadTraceV2(headerPath, dataPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(loaded.Records) != 2 {
+			t.Fatalf("expected 2 records, got %d", len(loaded.Records))
+		}
+		if loaded.Records[0].UpstreamRequestID != "srv-aaa" {
+			t.Errorf("record 0 UpstreamRequestID: got %q, want %q", loaded.Records[0].UpstreamRequestID, "srv-aaa")
+		}
+		if loaded.Records[1].UpstreamRequestID != "srv-bbb" {
+			t.Errorf("record 1 UpstreamRequestID: got %q, want %q", loaded.Records[1].UpstreamRequestID, "srv-bbb")
+		}
+	})
+
+	t.Run("real mode with no ids → column absent", func(t *testing.T) {
+		header := &TraceHeader{Version: 2, TimeUnit: "us", Mode: "real"}
+		records := []TraceRecord{
+			{RequestID: 1, InputTokens: 100, OutputTokens: 50, ArrivalTimeUs: 1000, Status: "ok", XRequestID: "uuid-aaa"},
+		}
+
+		headerPath := filepath.Join(dir, "noup_header.yaml")
+		dataPath := filepath.Join(dir, "noup_data.csv")
+		if err := ExportTraceV2(header, records, headerPath, dataPath); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(dataPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "upstream_request_id") {
+			t.Errorf("upstream_request_id should be absent when no record carries one, got: %s", string(data))
+		}
+	})
+
+	t.Run("replayed mode → column absent even with ids", func(t *testing.T) {
+		// A replay re-export's ids no longer correspond to any real routing
+		// decision, so emitting them would invite a bogus join.
+		header := &TraceHeader{Version: 2, TimeUnit: "us", Mode: "replayed"}
+		records := []TraceRecord{
+			{RequestID: 1, InputTokens: 100, OutputTokens: 50, ArrivalTimeUs: 1000, Status: "ok", UpstreamRequestID: "srv-aaa"},
+		}
+
+		headerPath := filepath.Join(dir, "replay_up_header.yaml")
+		dataPath := filepath.Join(dir, "replay_up_data.csv")
+		if err := ExportTraceV2(header, records, headerPath, dataPath); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(dataPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "upstream_request_id") {
+			t.Errorf("upstream_request_id must not appear in replayed-mode export, got: %s", string(data))
+		}
+	})
+}
+
+// TestLoadTraceV2_WithoutUpstreamRequestID_BackwardCompatible verifies that a
+// CSV written before this column existed still loads.
+func TestLoadTraceV2_WithoutUpstreamRequestID_BackwardCompatible(t *testing.T) {
+	dir := t.TempDir()
+
+	header := &TraceHeader{Version: 2, TimeUnit: "us", Mode: "real"}
+	records := []TraceRecord{
+		{RequestID: 1, InputTokens: 100, OutputTokens: 50, ArrivalTimeUs: 1000, Status: "ok", XRequestID: "uuid-aaa"},
+	}
+
+	headerPath := filepath.Join(dir, "compat_header.yaml")
+	dataPath := filepath.Join(dir, "compat_data.csv")
+	if err := ExportTraceV2(header, records, headerPath, dataPath); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadTraceV2(headerPath, dataPath)
+	if err != nil {
+		t.Fatalf("loading trace without upstream_request_id should succeed, got: %v", err)
+	}
+	if len(loaded.Records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(loaded.Records))
+	}
+	if loaded.Records[0].XRequestID != "uuid-aaa" {
+		t.Errorf("XRequestID: got %q, want %q", loaded.Records[0].XRequestID, "uuid-aaa")
+	}
+	if loaded.Records[0].UpstreamRequestID != "" {
+		t.Errorf("UpstreamRequestID: got %q, want empty", loaded.Records[0].UpstreamRequestID)
+	}
+}
+
+// TestExportTraceV2_UpstreamRequestID_ColumnOrderAndCoexistence pins the header
+// order of the two trailing id columns and verifies that adding a second
+// trailing column leaves the positional parsing of the earlier optional columns
+// intact.
+func TestExportTraceV2_UpstreamRequestID_ColumnOrderAndCoexistence(t *testing.T) {
+	dir := t.TempDir()
+
+	header := &TraceHeader{Version: 2, TimeUnit: "us", Mode: "real"}
+	records := []TraceRecord{
+		{
+			RequestID: 1, InputTokens: 100, OutputTokens: 50, ArrivalTimeUs: 1000,
+			Status: "ok", SLOClass: "batch", VLLMPriority: 5, SLOTargetUs: 100000,
+			XRequestID: "uuid-zzz", UpstreamRequestID: "srv-zzz",
+		},
+	}
+
+	headerPath := filepath.Join(dir, "order_header.yaml")
+	dataPath := filepath.Join(dir, "order_data.csv")
+	if err := ExportTraceV2(header, records, headerPath, dataPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headerLine := strings.Split(string(data), "\n")[0]
+	if !strings.HasSuffix(headerLine, "x_request_id,upstream_request_id") {
+		t.Errorf("header must end with x_request_id,upstream_request_id, got: %s", headerLine)
+	}
+
+	loaded, err := LoadTraceV2(headerPath, dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(loaded.Records))
+	}
+	got := loaded.Records[0]
+	if got.VLLMPriority != 5 {
+		t.Errorf("VLLMPriority: got %d, want 5", got.VLLMPriority)
+	}
+	if got.SLOTargetUs != 100000 {
+		t.Errorf("SLOTargetUs: got %d, want 100000", got.SLOTargetUs)
+	}
+	if got.XRequestID != "uuid-zzz" {
+		t.Errorf("XRequestID: got %q, want %q", got.XRequestID, "uuid-zzz")
+	}
+	if got.UpstreamRequestID != "srv-zzz" {
+		t.Errorf("UpstreamRequestID: got %q, want %q", got.UpstreamRequestID, "srv-zzz")
 	}
 }

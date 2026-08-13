@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -2380,6 +2381,307 @@ func TestRecorder_PropagatesXRequestID(t *testing.T) {
 	}
 	if records[0].XRequestID != "uuid-test-value" {
 		t.Errorf("TraceRecord.XRequestID: got %q, want %q", records[0].XRequestID, "uuid-test-value")
+	}
+}
+
+// TestRealClient_CapturesUpstreamRequestID verifies that the id the model server
+// assigned to the request is recovered from the response and stored with the
+// OpenAI object prefix stripped.
+//
+// Why this matters: a gateway proxy owns the x-request-id header and rewrites it
+// for edge requests, so the UUID the client sent is not the id the router logged.
+// vLLM derives its request id from whatever x-request-id reached it and echoes it
+// back as the response `id` ("chatcmpl-<id>" for chat, "cmpl-<id>" for
+// completions), which is the id the router logged. Recording it gives a join key
+// that does not depend on the proxy preserving the client's header.
+func TestRealClient_CapturesUpstreamRequestID(t *testing.T) {
+	tests := []struct {
+		name      string
+		streaming bool
+		// responseID is the `id` the stub server puts in the response; empty
+		// means the field is omitted entirely.
+		responseID string
+		// omitID sends an `id` of a non-string type instead of omitting it.
+		nonStringID bool
+		want        string
+	}{
+		{
+			name:       "streaming chat response strips chatcmpl prefix",
+			streaming:  true,
+			responseID: "chatcmpl-abc123",
+			want:       "abc123",
+		},
+		{
+			name:       "non-streaming completions response strips cmpl prefix",
+			responseID: "cmpl-abc123",
+			want:       "abc123",
+		},
+		{
+			name:       "streaming completions response strips cmpl prefix",
+			streaming:  true,
+			responseID: "cmpl-def456",
+			want:       "def456",
+		},
+		{
+			name:       "non-streaming chat response strips chatcmpl prefix",
+			responseID: "chatcmpl-def456",
+			want:       "def456",
+		},
+		{
+			name: "unknown prefix is preserved verbatim rather than mangled",
+			// A server that does not use an OpenAI object prefix must not have
+			// its id silently truncated — an unjoinable id is recoverable, a
+			// corrupted one is not.
+			responseID: "weird-1",
+			want:       "weird-1",
+		},
+		{
+			name:       "id without any prefix is preserved verbatim",
+			responseID: "bare0123",
+			want:       "bare0123",
+		},
+		{
+			name:       "absent id yields empty value",
+			responseID: "",
+			want:       "",
+		},
+		{
+			name:        "non-string id yields empty value",
+			nonStringID: true,
+			want:        "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.streaming {
+					flusher, ok := w.(http.Flusher)
+					if !ok {
+						t.Fatal("expected http.Flusher")
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					chunk := map[string]interface{}{
+						"choices": []map[string]interface{}{
+							{"delta": map[string]interface{}{"content": "tok"}},
+						},
+					}
+					if tc.nonStringID {
+						chunk["id"] = 12345.0
+					} else if tc.responseID != "" {
+						chunk["id"] = tc.responseID
+					}
+					body, err := json.Marshal(chunk)
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", body)
+					flusher.Flush()
+					_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n")
+					flusher.Flush()
+					_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+					flusher.Flush()
+					return
+				}
+
+				resp := map[string]interface{}{
+					"choices": []map[string]interface{}{{"text": "hello", "finish_reason": "stop"}},
+					"usage":   map[string]interface{}{"prompt_tokens": 10.0, "completion_tokens": 5.0},
+				}
+				if tc.nonStringID {
+					resp["id"] = 12345.0
+				} else if tc.responseID != "" {
+					resp["id"] = tc.responseID
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(resp)
+			}))
+			defer server.Close()
+
+			client := NewRealClient(server.URL, "", "test-model", "vllm")
+			record, err := client.Send(context.Background(), &PendingRequest{
+				RequestID: 1, InputTokens: 10, Streaming: tc.streaming, Prompt: "hello",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.UpstreamRequestID != tc.want {
+				t.Errorf("UpstreamRequestID = %q, want %q", record.UpstreamRequestID, tc.want)
+			}
+			// The client-minted UUID is an independent key and must survive
+			// regardless of what the server reported.
+			if record.XRequestID == "" {
+				t.Error("XRequestID must remain populated alongside UpstreamRequestID")
+			}
+		})
+	}
+}
+
+// TestRealClient_UpstreamRequestID_FirstChunkWins verifies that a streaming
+// response whose later chunks repeat or change `id` does not overwrite the id
+// captured from the first chunk that carried one.
+func TestRealClient_UpstreamRequestID_FirstChunkWins(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("expected http.Flusher")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		// First content chunk carries no id at all, so capture must not stop at
+		// chunk one; the second carries the real id; the third a different one.
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n")
+		flusher.Flush()
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-first\",\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n")
+		flusher.Flush()
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-second\",\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n")
+		flusher.Flush()
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n")
+		flusher.Flush()
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	client := NewRealClient(server.URL, "", "test-model", "vllm")
+	record, err := client.Send(context.Background(), &PendingRequest{
+		RequestID: 1, InputTokens: 10, Streaming: true, Prompt: "hello",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.UpstreamRequestID != "first" {
+		t.Errorf("UpstreamRequestID = %q, want %q (first id seen must win)", record.UpstreamRequestID, "first")
+	}
+}
+
+// TestRealClient_UpstreamRequestID_EmptyOnServerError verifies that a failed
+// request records no upstream id: there is no response body to read one from.
+// The client-minted XRequestID is what keeps such requests attributable.
+func TestRealClient_UpstreamRequestID_EmptyOnServerError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewRealClient(server.URL, "", "test-model", "vllm")
+	record, err := client.Send(context.Background(), &PendingRequest{
+		RequestID: 99, InputTokens: 5, Streaming: false, Prompt: "x",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "error" {
+		t.Errorf("status = %q, want error", record.Status)
+	}
+	if record.UpstreamRequestID != "" {
+		t.Errorf("UpstreamRequestID = %q, want empty on server error", record.UpstreamRequestID)
+	}
+	if record.XRequestID == "" {
+		t.Error("XRequestID must be populated even on server error")
+	}
+}
+
+// TestRecorder_PropagatesUpstreamRequestID verifies Recorder.RecordRequest copies
+// UpstreamRequestID from RequestRecord into the workload.TraceRecord, which is
+// what reaches trace_data.csv.
+func TestRecorder_PropagatesUpstreamRequestID(t *testing.T) {
+	recorder := &Recorder{}
+	result := &RequestRecord{
+		RequestID:         42,
+		Status:            "ok",
+		OutputTokens:      50,
+		XRequestID:        "uuid-test-value",
+		UpstreamRequestID: "server-side-id",
+		SendTimeUs:        1000,
+	}
+	recorder.RecordRequest(&PendingRequest{RequestID: 42, InputTokens: 100}, result, 500, "session-x", 0)
+
+	records := recorder.Records()
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+	if records[0].UpstreamRequestID != "server-side-id" {
+		t.Errorf("TraceRecord.UpstreamRequestID: got %q, want %q", records[0].UpstreamRequestID, "server-side-id")
+	}
+	if records[0].XRequestID != "uuid-test-value" {
+		t.Errorf("TraceRecord.XRequestID: got %q, want %q", records[0].XRequestID, "uuid-test-value")
+	}
+}
+
+// TestObserve_UpstreamRequestID_EndToEndCSV exercises the whole path the
+// feature exists for: client sends a request, a server that behaves like vLLM
+// (deriving its response id from the x-request-id it received) answers, and the
+// exported trace_data.csv carries an upstream_request_id that equals the id the
+// server saw.
+//
+// The stub deliberately rewrites the header on the way in — as an edge proxy
+// does — so the test proves the recorded value tracks what reached the *server*,
+// not what the client sent. That is the property the join depends on.
+func TestObserve_UpstreamRequestID_EndToEndCSV(t *testing.T) {
+	const proxyAssignedID = "proxy-rewrote-this"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Whatever the client sent, the id the server uses is its own — mirroring
+		// an Envoy edge rewrite followed by vLLM's _base_request_id.
+		resp := map[string]interface{}{
+			"id":      "chatcmpl-" + proxyAssignedID,
+			"choices": []map[string]interface{}{{"text": "hello", "finish_reason": "stop"}},
+			"usage":   map[string]interface{}{"prompt_tokens": 20.0, "completion_tokens": 4.0},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewRealClient(server.URL, "", "test-model", "vllm")
+	record, err := client.Send(context.Background(), &PendingRequest{
+		RequestID: 1, InputTokens: 20, Streaming: false, Prompt: "hello",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := &Recorder{}
+	recorder.RecordRequest(&PendingRequest{RequestID: 1, InputTokens: 20}, record, 500, "", 0)
+
+	dir := t.TempDir()
+	headerPath := filepath.Join(dir, "trace.yaml")
+	dataPath := filepath.Join(dir, "trace.csv")
+	if err := recorder.Export(&workload.TraceHeader{Version: 2, TimeUnit: "us", Mode: "real"}, headerPath, dataPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected header + 1 data row, got %d line(s): %q", len(lines), string(data))
+	}
+
+	cols := strings.Split(lines[0], ",")
+	idx := -1
+	for i, c := range cols {
+		if c == "upstream_request_id" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatalf("upstream_request_id column missing from CSV header: %s", lines[0])
+	}
+
+	fields := strings.Split(lines[1], ",")
+	if got := fields[idx]; got != proxyAssignedID {
+		t.Errorf("upstream_request_id = %q, want %q (the id the server used)", got, proxyAssignedID)
+	}
+	// And the client's own UUID is still there, distinct from it.
+	if record.XRequestID == proxyAssignedID {
+		t.Fatal("test setup error: client UUID must differ from the server-assigned id")
+	}
+	if !strings.Contains(lines[1], record.XRequestID) {
+		t.Errorf("client x_request_id %q missing from CSV row: %s", record.XRequestID, lines[1])
 	}
 }
 
