@@ -152,7 +152,7 @@ func TestObserveOrchestrator_OpenLoop_ConservationAndConcurrency(t *testing.T) {
 
 	// WHEN dispatching with max-concurrency 2 and 0 warmup
 	ctx := context.Background()
-	runObserveOrchestrator(ctx, client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 2, 0, nil, nil, false, false, 1.0)
+	runObserveOrchestrator(ctx, client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 2, 0, nil, nil, false, false, 1.0, 0)
 
 	// THEN: BC-6 conservation: all 5 requests recorded
 	records := recorder.Records()
@@ -219,7 +219,7 @@ func TestObserveOrchestrator_SessionFollowUp_GeneratesRound2(t *testing.T) {
 	sessionMgr := workload.NewSessionManager(wl.Sessions)
 
 	ctx := context.Background()
-	runObserveOrchestrator(ctx, client, recorder, sessionMgr, cluster.NewSliceRequestSource(wl.Requests), false, 10, 0, nil, nil, false, false, 1.0)
+	runObserveOrchestrator(ctx, client, recorder, sessionMgr, cluster.NewSliceRequestSource(wl.Requests), false, 10, 0, nil, nil, false, false, 1.0, 0)
 
 	records := recorder.Records()
 	if len(records) < 2 {
@@ -286,7 +286,7 @@ func TestObserveOrchestrator_SessionError_CancelsSession(t *testing.T) {
 	sessionMgr := workload.NewSessionManager(wl.Sessions)
 
 	ctx := context.Background()
-	runObserveOrchestrator(ctx, client, recorder, sessionMgr, cluster.NewSliceRequestSource(wl.Requests), false, 10, 0, nil, nil, false, false, 1.0)
+	runObserveOrchestrator(ctx, client, recorder, sessionMgr, cluster.NewSliceRequestSource(wl.Requests), false, 10, 0, nil, nil, false, false, 1.0, 0)
 
 	records := recorder.Records()
 	for _, r := range records {
@@ -318,7 +318,7 @@ func TestObserveOrchestrator_WarmupExclusion(t *testing.T) {
 
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
-	runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 10, 2, nil, nil, false, false, 1.0)
+	runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 10, 2, nil, nil, false, false, 1.0, 0)
 
 	records := recorder.Records()
 	if len(records) != 3 {
@@ -346,7 +346,7 @@ func TestObserveOrchestrator_WarmupExceedsTotal(t *testing.T) {
 
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
-	runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 10, 5, nil, nil, false, false, 1.0)
+	runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 10, 5, nil, nil, false, false, 1.0, 0)
 
 	records := recorder.Records()
 	if len(records) != 0 {
@@ -385,7 +385,7 @@ func TestObserveOrchestrator_RecordITL_CapturesChunkTimestamps(t *testing.T) {
 
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
-	runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 10, 0, nil, nil, false, true, 1.0)
+	runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 10, 0, nil, nil, false, true, 1.0, 0)
 
 	// THEN ITL records are captured
 	itlRecords := recorder.ITLRecords()
@@ -474,7 +474,7 @@ func TestObserveOrchestrator_RecordITL_CoversSessionFollowUps(t *testing.T) {
 	sessionMgr := workload.NewSessionManager(wl.Sessions)
 	// recordITL=true (last-but-one arg), noStreaming=false.
 	runObserveOrchestrator(context.Background(), client, recorder, sessionMgr,
-		cluster.NewSliceRequestSource(wl.Requests), false, 1, 0, nil, nil, false, true, 1.0)
+		cluster.NewSliceRequestSource(wl.Requests), false, 1, 0, nil, nil, false, true, 1.0, 0)
 
 	// A round-1 follow-up must exist and must have captured ITL (per-chunk
 	// timestamps), proving streaming-on was applied to the follow-up too.
@@ -524,7 +524,7 @@ func TestObserveOrchestrator_TimestampOrdering(t *testing.T) {
 
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
-	runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 10, 0, nil, nil, false, false, 1.0)
+	runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 10, 0, nil, nil, false, false, 1.0, 0)
 
 	records := recorder.Records()
 	if len(records) != 1 {
@@ -564,7 +564,7 @@ func TestObserveOrchestrator_TraceV2RoundTrip(t *testing.T) {
 
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
-	runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 10, 0, nil, nil, false, false, 1.0)
+	runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 10, 0, nil, nil, false, false, 1.0, 0)
 
 	headerPath := filepath.Join(t.TempDir(), "header.yaml")
 	dataPath := filepath.Join(t.TempDir(), "data.csv")
@@ -666,7 +666,7 @@ func TestObserveOrchestrator_MergeOrder_OpenLoopExactSequence(t *testing.T) {
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
 	runObserveOrchestrator(context.Background(), client, recorder, nil,
-		cluster.NewSliceRequestSource(requests), false, 1, 0, nil, nil, false, false, 1.0)
+		cluster.NewSliceRequestSource(requests), false, 1, 0, nil, nil, false, false, 1.0, 0)
 
 	records := recorder.Records()
 	if len(records) != len(requests) {
@@ -749,7 +749,7 @@ func TestObserveOrchestrator_EagerLazyParity_SameDispatchSequence(t *testing.T) 
 		NewRealClient(eagerServer.URL, "", "test-model", "vllm"),
 		eagerRec, workload.NewSessionManager(eagerWL.Sessions),
 		cluster.NewSliceRequestSource(eagerWL.Requests),
-		false, 1, 0, nil, nil, false, false, 1.0)
+		false, 1, 0, nil, nil, false, false, 1.0, 0)
 
 	// Lazy run — same spec/seed.
 	lazyServer := newStub()
@@ -766,7 +766,7 @@ func TestObserveOrchestrator_EagerLazyParity_SameDispatchSequence(t *testing.T) 
 	runObserveOrchestrator(context.Background(),
 		NewRealClient(lazyServer.URL, "", "test-model", "vllm"),
 		lazyRec, lazyMgr, lazySrc,
-		false, 1, 0, nil, nil, false, false, 1.0)
+		false, 1, 0, nil, nil, false, false, 1.0, 0)
 
 	// Group by (SessionID, RoundIndex) — the stable deterministic key —
 	// so the comparison does not depend on record-append order.
@@ -963,7 +963,7 @@ func TestObserveOrchestrator_ErrorStormDrain(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 5, 0, nil, nil, false, false, 1.0)
+		runObserveOrchestrator(context.Background(), client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 5, 0, nil, nil, false, false, 1.0, 0)
 		close(done)
 	}()
 
@@ -1007,7 +1007,7 @@ func TestObserveOrchestrator_ContextCancellation(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runObserveOrchestrator(ctx, client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 2, 0, nil, nil, false, false, 1.0)
+		runObserveOrchestrator(ctx, client, recorder, nil, cluster.NewSliceRequestSource(requests), false, 2, 0, nil, nil, false, false, 1.0, 0)
 		close(done)
 	}()
 

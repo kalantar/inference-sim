@@ -3,6 +3,8 @@ package workload
 import (
 	"fmt"
 	"math/rand"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/inference-sim/inference-sim/sim"
@@ -60,6 +62,34 @@ func TestShuffleSessions_ReproducibleAndLockstep(t *testing.T) {
 	}
 }
 
+// drainPool completes every admitted session in admission order and returns the full
+// sequence of admitted round-0 requests. Single-round blueprints terminate on their
+// round-0 completion, so one OnComplete per admitted session drains the pool. maxDrain
+// caps the loop, since an open-ended queue would otherwise never end.
+func drainPool(d *SessionPoolDriver, initial []*sim.Request, maxDrain int) []*sim.Request {
+	admitted := append([]*sim.Request{}, initial...)
+	pending := append([]*sim.Request{}, initial...)
+	for n := 0; len(pending) > 0 && n < maxDrain; n++ {
+		r := pending[0]
+		pending = pending[1:]
+		r.State = sim.StateCompleted
+		r.ProgressIndex = int64(r.InputLen())
+		next := d.OnComplete(r, 1000)
+		admitted = append(admitted, next...)
+		pending = append(pending, next...)
+	}
+	return admitted
+}
+
+// sessionIDsOf maps admitted requests to their SessionIDs for order assertions.
+func sessionIDsOf(reqs []*sim.Request) []string {
+	ids := make([]string, 0, len(reqs))
+	for _, r := range reqs {
+		ids = append(ids, r.SessionID)
+	}
+	return ids
+}
+
 // makeBP builds a minimal 1-round blueprint + its round-0 request for tests.
 func makeBP(id string, seed int64) (SessionBlueprint, *sim.Request) {
 	bp := SessionBlueprint{
@@ -84,12 +114,23 @@ func TestBuildSessionPool_DuplicatesToTarget(t *testing.T) {
 	if len(initial) != 2 {
 		t.Fatalf("initial injected = %d, want 2 (pool size)", len(initial))
 	}
-	// 5 total sessions must be registered, with unique SessionIDs (clones renamed).
+	// 5 total sessions must run, with unique SessionIDs (clones renamed).
 	if got := d.TotalSessions(); got != 5 {
 		t.Errorf("total sessions = %d, want 5", got)
 	}
-	if !d.hasUniqueSessionIDs() {
-		t.Errorf("duplicated sessions must have unique IDs")
+	// Uniqueness is asserted over the sessions actually ADMITTED (draining the pool)
+	// rather than over a pre-built queue: sessions are materialized on demand, so the
+	// admitted sequence is the only place the full set is observable.
+	admitted := drainPool(d, initial, 50)
+	if len(admitted) != 5 {
+		t.Fatalf("admitted %d sessions, want 5", len(admitted))
+	}
+	seen := make(map[string]struct{}, len(admitted))
+	for _, r := range admitted {
+		if _, dup := seen[r.SessionID]; dup {
+			t.Errorf("duplicated sessions must have unique IDs; %q admitted twice", r.SessionID)
+		}
+		seen[r.SessionID] = struct{}{}
 	}
 }
 
@@ -257,5 +298,214 @@ func TestBuildSessionPool_ClonesHaveIndependentSamplers(t *testing.T) {
 	// source has already advanced past index 0 and 1.
 	if got := clone.InputSampler.Sample(nil); got != 10 {
 		t.Fatalf("clone InputSampler sample #1 = %d, want 10 (independent cursor) — got the source's advanced value, indicating a shared cursor", got)
+	}
+}
+
+// TestSessionPool_CountBoundedAdmissionSequence_Golden pins the EXACT sequence a
+// count-bounded pool admits: which sessions, in which order, and the cache-busting
+// token each clone's round-0 input is prefixed with. The token values come from the
+// seeded clone RNG, so this pins the whole seeded derivation — the clone order AND
+// the number of draws taken per clone.
+//
+// Captured from the build that pre-dates on-demand session materialization. It is
+// the unit-level guard that generating clones lazily (at admission) rather than
+// eagerly (up front) does not perturb the seeded sequence: each clone still consumes
+// exactly one draw from the shared stream, in clone order. Its CLI-level companion
+// is TestReplayCmd_SessionPool_Deterministic.
+func TestSessionPool_CountBoundedAdmissionSequence_Golden(t *testing.T) {
+	bp0, r0 := makeBP("s0", 1)
+	bp1, r1 := makeBP("s1", 2)
+	d, initial, err := BuildSessionPool([]SessionBlueprint{bp0, bp1}, []*sim.Request{r0, r1}, 2, 5, 99)
+	if err != nil {
+		t.Fatalf("BuildSessionPool: %v", err)
+	}
+	admitted := drainPool(d, initial, 50)
+
+	wantIDs := []string{"s0", "s1", "s0_dup1", "s1_dup2", "s0_dup3"}
+	if got := sessionIDsOf(admitted); !reflect.DeepEqual(got, wantIDs) {
+		t.Errorf("admission order = %v, want %v", got, wantIDs)
+	}
+
+	// Originals carry the corpus input verbatim (empty here); each clone is prefixed
+	// with one seeded cache-busting token so its block-hash chain diverges at once.
+	wantTokens := map[string][]sim.TokenID{
+		"s0":      {},
+		"s1":      {},
+		"s0_dup1": {50452},
+		"s1_dup2": {24822},
+		"s0_dup3": {90142},
+	}
+	for _, r := range admitted {
+		want, ok := wantTokens[r.SessionID]
+		if !ok {
+			t.Errorf("unexpected session %q admitted", r.SessionID)
+			continue
+		}
+		if len(r.InputTokens) != len(want) {
+			t.Errorf("%s: input tokens = %v, want %v", r.SessionID, r.InputTokens, want)
+			continue
+		}
+		for i := range want {
+			if r.InputTokens[i] != want[i] {
+				t.Errorf("%s: input token[%d] = %d, want %d (seeded clone derivation changed)",
+					r.SessionID, i, r.InputTokens[i], want[i])
+			}
+		}
+	}
+}
+
+// TestSessionPool_QueueIsOpenEnded verifies the queue is no longer
+// pre-sized under a clock bound: the corpus is cycled with fresh cache-busting
+// clones on demand, so the queue never runs dry before the bound instead of draining
+// after one pass over a small corpus.
+func TestSessionPool_QueueIsOpenEnded(t *testing.T) {
+	bp0, r0 := makeBP("s0", 1)
+	bp1, r1 := makeBP("s1", 2)
+	// Bound far beyond every completion tick, so admission is never suppressed and
+	// the only thing that can stop the drain is the queue running dry.
+	d, initial, err := BuildSessionPool([]SessionBlueprint{bp0, bp1}, []*sim.Request{r0, r1},
+		2, 0, 99, WithOpenEndedQueue())
+	if err != nil {
+		t.Fatalf("BuildSessionPool: %v", err)
+	}
+	admitted := drainPool(d, initial, 25)
+	if len(admitted) <= 2 {
+		t.Fatalf("admitted %d sessions from a 2-session corpus; an open-ended queue must "+
+			"keep cloning past the corpus rather than draining", len(admitted))
+	}
+	seen := map[string]bool{}
+	for _, r := range admitted {
+		if seen[r.SessionID] {
+			t.Errorf("session %q admitted twice; each admission must be a distinct session", r.SessionID)
+		}
+		seen[r.SessionID] = true
+	}
+}
+
+// TestBuildSessionPool_RejectsBothBounds pins that the two ways to size a run are
+// alternatives, not an addition — honouring both would leave the end reason
+// ambiguous, so the combination is refused rather than silently resolved (R1).
+func TestBuildSessionPool_RejectsBothBounds(t *testing.T) {
+	bp0, r0 := makeBP("s0", 1)
+	_, _, err := BuildSessionPool([]SessionBlueprint{bp0}, []*sim.Request{r0},
+		1, 5, 99, WithOpenEndedQueue())
+	if err == nil {
+		t.Fatal("expected an error when a session-count total and an admission deadline are both set")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want it to say the two bounds are mutually exclusive", err)
+	}
+}
+
+// TestBuildSessionPool_RejectsMalformedCorpusUpFront pins that a blueprint the
+// session machinery cannot drive is reported when the pool is BUILT, not when that
+// session happens to be admitted — on-demand materialization would otherwise defer
+// the failure into the middle of a run, or hide it entirely if the bound stopped
+// admission first.
+func TestBuildSessionPool_RejectsMalformedCorpusUpFront(t *testing.T) {
+	good, goodR0 := makeBP("s0", 1)
+	bad, badR0 := makeBP("s1", 2)
+	bad.MaxRounds = 0 // undrivable
+	_, _, err := BuildSessionPool([]SessionBlueprint{good, bad}, []*sim.Request{goodR0, badR0}, 1, 0, 99)
+	if err == nil {
+		t.Fatal("expected an error for a blueprint with MaxRounds=0")
+	}
+	if !strings.Contains(err.Error(), "s1") {
+		t.Errorf("error = %q, want it to name the offending session s1", err)
+	}
+}
+
+// TestSessionPool_ClonesAreBornPristine pins why the driver clones from snapshots
+// taken at construction rather than from the live corpus requests. An original
+// handed out as a refill is a live *sim.Request that the simulator mutates in place
+// (State, ProgressIndex, FirstTokenTime). Cloning from it after it has run would
+// produce a clone born already completed, which would then be injected as a new
+// request. Verified by mutation: cloning from d.srcR0 instead of the snapshot makes
+// this fail while every other pool test still passes, so nothing else covers it.
+func TestSessionPool_ClonesAreBornPristine(t *testing.T) {
+	bp0, r0 := makeBP("s0", 1)
+	bp1, r1 := makeBP("s1", 2)
+	// pool=1 so s1 is admitted as a refill (mutated in place) before being cloned.
+	d, initial, err := BuildSessionPool([]SessionBlueprint{bp0, bp1}, []*sim.Request{r0, r1}, 1, 4, 99)
+	if err != nil {
+		t.Fatalf("BuildSessionPool: %v", err)
+	}
+
+	pending := append([]*sim.Request{}, initial...)
+	sawClone := false
+	for n := 1; len(pending) > 0 && n < 20; n++ {
+		r := pending[0]
+		pending = pending[1:]
+		// Stand in for what the simulator/orchestrator does to a live request.
+		r.State = sim.StateCompleted
+		r.ProgressIndex = 999
+		r.FirstTokenTime = 12345
+		for _, born := range d.OnComplete(r, 100000) {
+			if strings.Contains(born.SessionID, "_dup") {
+				sawClone = true
+				if born.State != sim.StateQueued {
+					t.Errorf("clone %s born with State=%v, want queued", born.SessionID, born.State)
+				}
+				if born.ProgressIndex != 0 {
+					t.Errorf("clone %s born with ProgressIndex=%d, want 0", born.SessionID, born.ProgressIndex)
+				}
+				if born.FirstTokenTime != 0 {
+					t.Errorf("clone %s born with FirstTokenTime=%d, want 0", born.SessionID, born.FirstTokenTime)
+				}
+			}
+			pending = append(pending, born)
+		}
+	}
+	if !sawClone {
+		t.Fatal("no clone was admitted; the assertion is vacuous")
+	}
+}
+
+// TestSessionPool_OpenEndedMatchesCountBoundedPrefix pins INV-6 for the open-ended
+// queue, which is the path --duration uses. The golden above covers only the
+// count-bounded sequence; both go through admitNext, so the open-ended sequence must be
+// a prefix-identical continuation of it. Without this, a change to how `limit` is read,
+// to the srcIdx cycling, or to when clonesMade increments would silently re-seed every
+// duration-bounded run and no test would move.
+//
+// It pairs with the golden rather than duplicating it: the golden is the ABSOLUTE anchor
+// (it catches any change to the sequence itself), while this catches a divergence that
+// affects ONLY the open-ended path, which the golden cannot see. Both mutations verified.
+func TestSessionPool_OpenEndedMatchesCountBoundedPrefix(t *testing.T) {
+	build := func(total int, opts ...SessionPoolOption) []*sim.Request {
+		bp0, r0 := makeBP("s0", 1)
+		bp1, r1 := makeBP("s1", 2)
+		d, initial, err := BuildSessionPool([]SessionBlueprint{bp0, bp1}, []*sim.Request{r0, r1}, 2, total, 99, opts...)
+		if err != nil {
+			t.Fatalf("BuildSessionPool(total=%d): %v", total, err)
+		}
+		return drainPool(d, initial, 12)
+	}
+
+	counted := build(6)
+	openEnded := build(0, WithOpenEndedQueue())
+	if len(counted) != 6 {
+		t.Fatalf("counted pool admitted %d, want 6", len(counted))
+	}
+	if len(openEnded) < 6 {
+		t.Fatalf("open-ended pool admitted only %d; it should not run dry", len(openEnded))
+	}
+
+	// Same sessions, in the same order, with the same seeded cache-busting tokens.
+	if got, want := sessionIDsOf(openEnded[:6]), sessionIDsOf(counted); !reflect.DeepEqual(got, want) {
+		t.Errorf("open-ended prefix = %v, want the count-bounded sequence %v", got, want)
+	}
+	for i := range counted {
+		a, b := counted[i].InputTokens, openEnded[i].InputTokens
+		if !reflect.DeepEqual(a, b) {
+			t.Errorf("session %d (%s): tokens %v under a count bound vs %v open-ended — the seeded clone stream diverged",
+				i, counted[i].SessionID, a, b)
+		}
+	}
+
+	// And the open-ended path is reproducible from the seed on its own.
+	again := build(0, WithOpenEndedQueue())
+	if got, want := sessionIDsOf(again), sessionIDsOf(openEnded); !reflect.DeepEqual(got, want) {
+		t.Errorf("same seed → different open-ended sequence:\n %v\n %v", got, want)
 	}
 }

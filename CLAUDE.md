@@ -365,6 +365,39 @@ go build -o blis main.go
   --concurrent-sessions 8 --total-sessions 200 \
   --trace-header observed.yaml --trace-data observed.csv
 
+# Bound a corpus observe run by TIME instead of session count (#1787). --duration and
+# --total-sessions are a strict ONE-OF (an alternative, not an addition; the one-of turns
+# on whether --total-sessions was SUPPLIED, since 0 is a meaningful value there). It is a
+# HARD STOP on sending: once that much of the MEASURED window has elapsed (from the start
+# of the dispatch loop, so --prewarm-duration and tokenizer calibration are excluded),
+# NOTHING further is sent — not a new session, and not the next round of a
+# session already in conversation — and the loop then waits for requests already on the
+# wire to finish. It does NOT abort them: the bound is a timer the dispatch loop selects
+# on, deliberately not a ctx deadline, since ctx is handed to each HTTP request.
+# CONSEQUENCE: sessions cut off mid-conversation are recorded as far as they got, so the
+# output trace holds PARTIAL sessions and is not a complete session corpus. In exchange
+# run length is tight — bound + the last in-flight request's latency — where letting
+# in-flight sessions finish would overshoot by a whole session's remaining rounds.
+# Until the bound the session queue is OPEN-ENDED: clones are produced on demand, so it
+# never runs dry after one pass over a small corpus. Use it when run length must be
+# chosen in advance — picking a session count for a 20-minute run requires knowing the
+# per-session duration, which depends on the server being measured, so two arms of one
+# experiment otherwise take different times.
+# --horizon stays REFUSED in corpus-mode (it bounds generated arrivals, and a corpus is
+# read from a file); its refusal names both sizing flags.
+# Observe-only: `blis replay` keeps --total-sessions and its simulated-clock --horizon.
+# The end-of-run report splits sessions three ways — terminal / truncated mid-conversation
+# / admitted but never sent — because only the middle class is "recorded as far as it got".
+# The pool driver holds NO clock: --duration only makes its queue open-ended
+# (WithOpenEndedQueue), and the dispatch loop owns the bound. A count-bounded pool stays
+# byte-identical to the pre-feature build (INV-6, pinned by a golden admission sequence).
+# KNOWN LIMITATION: SessionManager never drops a terminated session, so an open-ended run
+# retains every finished session's accumulate buffer — unbounded on a huge-ISL corpus.
+./blis observe --server-url http://localhost:8000 --model qwen/qwen3-14b \
+  --corpus-header corpus.yaml --corpus-data corpus.csv \
+  --concurrent-sessions 32 --duration 20m \
+  --trace-header observed.yaml --trace-data observed.csv
+
 # Run with gateway queue flow control (utilization-based saturation gating)
 ./blis run --model qwen/qwen3-14b --hardware H100 --tp 1 --flow-control --saturation-detector utilization \
   --queue-depth-threshold 5 --kv-cache-util-threshold 0.8

@@ -79,6 +79,7 @@ var (
 	observeConcurrentSessions int
 	observeTotalSessions      int
 	observeShuffleCorpus      bool
+	observeDuration           time.Duration
 	// saturationReport is declared in root.go and shared across run, replay, observe
 )
 
@@ -170,6 +171,7 @@ func init() {
 	observeCmd.Flags().StringVar(&observeCorpusData, "corpus-data", "", "Input TraceV2 corpus data CSV (corpus-mode). Distinct from the --trace-data OUTPUT.")
 	observeCmd.Flags().IntVar(&observeConcurrentSessions, "concurrent-sessions", 0, "Replay a fixed pool of N concurrent closed-loop sessions from --corpus-* against the server (0 = disabled). Mutually exclusive with spec-mode inputs (--workload/--workload-spec/--rate/--concurrency).")
 	observeCmd.Flags().IntVar(&observeTotalSessions, "total-sessions", 0, "Total sessions to replay under --concurrent-sessions; duplicates the corpus (with cache-busting) to fill. 0 = replay each corpus session once.")
+	observeCmd.Flags().DurationVar(&observeDuration, "duration", 0, "Bound a corpus run by TIME instead of session count (e.g. 20m): once this much of the measured window has elapsed, STOP SENDING \u2014 no new sessions and no further rounds of sessions already running \u2014 then wait for requests already on the wire to finish. Sessions cut off mid-conversation are recorded as far as they got, so the output trace contains partial sessions. Until the bound the session queue is open-ended (the corpus is cycled with cache-busting clones), so it never runs dry. Measured from the start of the dispatch loop, so it excludes --prewarm-duration and tokenizer calibration. Requires --concurrent-sessions > 0; mutually exclusive with --total-sessions.")
 	observeCmd.Flags().BoolVar(&observeShuffleCorpus, "shuffle-corpus", false, "Randomize the corpus step/admission order (seeded from --seed; uses the SAME permutation as `blis replay --shuffle-corpus`, so observe and replay of one corpus+seed select the same subset — for calibration parity). Requires --concurrent-sessions > 0. With --total-sessions < corpus this yields a seeded-random subset; every session still runs otherwise.")
 	observeCmd.Flags().StringVar(&observeSessionIDHeader, "session-id-header", defaultSessionIDHeader, "Request header carrying the closed-loop session id for session-aware EPP routing (session-affinity / predictive pinning). Must match the deployment's session-id-producer. Empty disables emission (issue #1505).")
 
@@ -292,11 +294,13 @@ func runObserve(cmd *cobra.Command, _ []string) {
 	// before BC-7 so a corpus-mode/spec-mode collision is reported specifically.
 	if msg := validateObserveCorpusFlags(
 		observeConcurrentSessions, observeTotalSessions,
+		cmd.Flags().Changed("total-sessions"),
 		observeCorpusHeader, observeCorpusData,
 		observeWorkload, observeWorkloadSpec,
 		cmd.Flags().Changed("rate"), observeConcurrency,
 		observeThinkTimeMs, observeThinkTimeDist, observeLazyGeneration,
 		cmd.Flags().Changed("horizon"), cmd.Flags().Changed("num-requests"), observeShuffleCorpus,
+		observeDuration,
 	); msg != "" {
 		logrus.Fatalf("%s", msg)
 	}
@@ -384,13 +388,21 @@ func runObserve(cmd *cobra.Command, _ []string) {
 			observeCorpusHeader, observeCorpusData,
 			observeConcurrentSessions, observeTotalSessions,
 			observeShuffleCorpus, observeSeed,
+			observeDuration > 0,
 		)
 		if perr != nil {
 			logrus.Fatalf("Failed to build corpus pool: %v", perr)
 		}
 		wl = &workload.GeneratedWorkload{} // empty; corpus drives dispatch via corpusInitial + poolDriver
-		logrus.Infof("Corpus-mode: pool=%d total=%d, %d initial sessions",
-			observeConcurrentSessions, poolDriver.TotalSessions(), len(corpusInitial))
+		// An open-ended queue has no total to announce; the count is only known once
+		// the bound stops the run.
+		if observeDuration > 0 {
+			logrus.Infof("Corpus-mode: pool=%d bounded by --duration %s (open-ended queue), %d initial sessions",
+				observeConcurrentSessions, observeDuration, len(corpusInitial))
+		} else {
+			logrus.Infof("Corpus-mode: pool=%d total=%d, %d initial sessions",
+				observeConcurrentSessions, poolDriver.TotalSessions(), len(corpusInitial))
+		}
 		// Auto-raise the HTTP socket cap so the pool is never throttled below N.
 		if observeMaxConcur < observeConcurrentSessions {
 			logrus.Infof("Auto-raising --max-concurrency %d → %d to match --concurrent-sessions",
@@ -651,16 +663,34 @@ func runObserve(cmd *cobra.Command, _ []string) {
 
 	// Run orchestrator
 	startTime := time.Now()
-	runObserveOrchestrator(ctx, client, recorder, completionHandler, observeSource, observeNoStreaming, observeMaxConcur, observeWarmup, prefixes, prefixLengths, observeUnconstrainedOutput, observeRecordITL, tokensPerWord)
+	// observeDuration is a hard stop on SENDING for corpus mode; validation confines it
+	// to corpus mode, so it is 0 (unbounded) on every spec-mode path.
+	stoppedAtBound := runObserveOrchestrator(ctx, client, recorder, completionHandler, observeSource, observeNoStreaming, observeMaxConcur, observeWarmup, prefixes, prefixLengths, observeUnconstrainedOutput, observeRecordITL, tokensPerWord, observeDuration)
 	logrus.Infof("Observation wall-clock time: %.3fs", time.Since(startTime).Seconds())
 
-	// Corpus-mode pool accounting parity with `blis replay` (#1487): warn if any
-	// pooled session was never admitted. In observe there is no wall-clock horizon
-	// (the loop drains on the active-session count), so a nonzero count here means a
-	// dispatched session's request left the pipeline before completing (e.g. a
-	// transport error), never a horizon cut.
+	// Corpus-mode pool accounting parity with `blis replay` (#1487).
 	if poolDriver != nil {
-		if un := poolDriver.Unstarted(); un > 0 {
+		if observeDuration > 0 {
+			// Under a hard stop an unfinished session is the NORMAL outcome. Three
+			// classes, because they mean different things to someone reading the trace:
+			// terminal (reached a terminal state), truncated (≥1 round recorded, then
+			// the bound stopped it — the partial sessions), and never sent (admitted but
+			// the bound landed first, so they contribute nothing).
+			started, ended := poolDriver.SessionsStarted(), poolDriver.SessionsTerminated()
+			withRows := countSessionsWithRecords(recorder.Records())
+			summary := fmt.Sprintf("%d sessions started: %d terminal, %d truncated mid-conversation, %d never sent",
+				started, ended, max(withRows-ended, 0), max(started-withRows, 0))
+			switch {
+			case !stoppedAtBound:
+				logrus.Warnf("Corpus-mode: the --duration bound (%s) was never reached — the run was cut short (interrupted?); %s", observeDuration, summary)
+			case ctx.Err() != nil:
+				// Interrupted during the drain: ctx is what each request carries, so
+				// requests still on the wire were aborted rather than completed.
+				logrus.Warnf("Corpus-mode: stopped sending at the --duration bound (%s), but an interrupt during the drain aborted requests still on the wire; %s", observeDuration, summary)
+			default:
+				logrus.Infof("Corpus-mode: stopped sending at the --duration bound (%s) and drained in-flight requests; %s", observeDuration, summary)
+			}
+		} else if un := poolDriver.Unstarted(); un > 0 {
 			logrus.Warnf("%d of %d pooled sessions never completed (a dispatched request errored out before terminating its session, so the pool slot was not refilled)",
 				un, poolDriver.TotalSessions())
 		}
@@ -1039,11 +1069,31 @@ func runObserveOrchestrator(
 	unconstrained bool,
 	recordITL bool,
 	tokensPerWord float64,
-) {
+	// dispatchBound (0 = unbounded) is a HARD stop on sending, measured from this loop's
+	// start: once it elapses no further request is dispatched — neither a new session nor
+	// the next round of one already in conversation — and the loop drains. Deliberately
+	// NOT a ctx deadline: ctx is handed to each HTTP request, so cancelling it would
+	// ABORT in-flight requests instead of letting them finish.
+	dispatchBound time.Duration,
+) (stoppedAtBound bool) {
 	semaphore := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
 	startWall := time.Now()
 	dispatchIndex := 0
+
+	// Two mechanisms for one bound: boundCh fires once so a blocking wait (the pacing
+	// sleep, or waiting on a follow-up) cannot sleep straight through it, and
+	// boundPassed covers the other direction — the bound elapsing while the loop was
+	// busy dispatching.
+	var boundCh <-chan time.Time
+	if dispatchBound > 0 {
+		timer := time.NewTimer(dispatchBound)
+		defer timer.Stop()
+		boundCh = timer.C
+	}
+	boundPassed := func() bool {
+		return dispatchBound > 0 && time.Since(startWall) >= dispatchBound
+	}
 
 	// Channel for session follow-ups (buffered to avoid blocking serializer)
 	followUpCh := make(chan *sim.Request, maxConcurrency)
@@ -1171,6 +1221,16 @@ func runObserveOrchestrator(
 	}
 
 	for {
+		// Hard stop, fast path: bail out before doing the work of selecting and pacing
+		// a request that would only be discarded. The GUARANTEE that nothing is sent at
+		// or after the bound comes from the final gate just before dispatch below —
+		// removing this check changes no observable behaviour, which is why no test
+		// pins it on its own.
+		if boundPassed() {
+			stoppedAtBound = true
+			goto drain
+		}
+
 		// Drain any buffered follow-ups
 		drainFollowUps()
 
@@ -1204,6 +1264,16 @@ func runObserveOrchestrator(
 				}
 				nextReq = fu
 
+			// Promptness only, not correctness: without this the loop would wait here
+			// for the next completion and catch the bound at the top of the next
+			// iteration, and the drain below waits for those same in-flight requests
+			// either way — so no request is sent late and the run is no longer. That is
+			// why no test isolates this arm (verified by mutation); it is kept because a
+			// hard stop should not sit in a blocking wait past its own bound.
+			case <-boundCh:
+				stoppedAtBound = true
+				goto drain
+
 			case <-ctx.Done():
 				goto drain
 			}
@@ -1230,6 +1300,9 @@ func runObserveOrchestrator(
 		if sleepDur > 0 {
 			select {
 			case <-time.After(sleepDur):
+			case <-boundCh:
+				stoppedAtBound = true
+				goto drain
 			case <-ctx.Done():
 				goto drain
 			}
@@ -1242,6 +1315,16 @@ func runObserveOrchestrator(
 			goto drain
 		}
 
+		// The one point every dispatch passes through, so re-checking here is what makes
+		// the bound literal — no request is SENT at or after it. The selects above cannot
+		// guarantee that: Go picks randomly between a ready boundCh and a ready follow-up,
+		// and the pacing select is skipped for a request already due.
+		if boundPassed() {
+			<-semaphore
+			stoppedAtBound = true
+			goto drain
+		}
+
 		idx := dispatchIndex
 		dispatchIndex++
 		wg.Add(1)
@@ -1249,14 +1332,44 @@ func runObserveOrchestrator(
 	}
 
 drain:
-	// Wait for all in-flight requests
+	// Nothing reads followUpCh past this point, but completions still landing push onto
+	// it — one entry each. If those fill the channel the serializer blocks on a push,
+	// stops reading completionCh, and the wait below never returns: a hang. Note the
+	// semaphore does NOT bound this (a buffered entry came from a request that already
+	// released its slot), so keep the channel drained rather than relying on
+	// --max-concurrency being auto-raised to --concurrent-sessions far from here.
+	// Sending has stopped, so no session admitted from here on could ever be
+	// dispatched. Tell the pool, or completions arriving during the drain would keep
+	// admitting replacements and inflate the reported session counts.
+	if stopper, ok := handler.(interface{ StopAdmitting() }); ok {
+		stopper.StopAdmitting()
+	}
+
+	var drainerDone chan struct{}
+	if handler != nil {
+		drainerDone = make(chan struct{})
+		go func() {
+			for {
+				select {
+				case <-followUpCh:
+				case <-drainerDone:
+					return
+				}
+			}
+		}()
+	}
+
+	// On the BOUND path ctx is untouched, so requests on the wire finish and are
+	// recorded. On the INTERRUPT path ctx is already cancelled and they abort instead,
+	// which the run reports rather than claiming a clean drain.
 	wg.Wait()
 
-	// Close session channels
 	if handler != nil {
 		close(completionCh)
 		<-serializerDone
+		close(drainerDone)
 	}
+	return stoppedAtBound
 }
 
 // adaptForSessionManager converts an HTTP response into a sim.Request suitable

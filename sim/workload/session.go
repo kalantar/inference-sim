@@ -84,21 +84,38 @@ type SessionManager struct {
 func NewSessionManager(blueprints []SessionBlueprint) *SessionManager {
 	sm := &SessionManager{sessions: make(map[string]*activeSession, len(blueprints))}
 	for i := range blueprints {
-		bp := &blueprints[i]
-		if bp.MaxRounds < 1 && !bp.UnlimitedRounds {
-			panic(fmt.Sprintf("NewSessionManager: session %s has MaxRounds=%d, must be >= 1", bp.SessionID, bp.MaxRounds))
-		}
-		var buf *sessionTokenBuffer
-		if bp.ContextGrowth == "accumulate" {
-			buf = newSessionTokenBuffer()
-		}
-		sm.sessions[bp.SessionID] = &activeSession{
-			blueprint: bp,
-			buf:       buf,
-			state:     sessionActive,
-		}
+		// Pointer INTO the caller's slice: safe because this slice is never appended
+		// to (contrast RegisterSession, which must copy for exactly that reason).
+		sm.addSession(&blueprints[i])
 	}
 	return sm
+}
+
+// RegisterSession adds a session after construction, so a caller materializing sessions
+// lazily (SessionPoolDriver's on-demand queue) can hand each one over at admission time.
+// Validation matches NewSessionManager's. The blueprint is taken BY VALUE and retained
+// as a heap copy: the manager holds a *SessionBlueprint, and a lazy caller has only a
+// local value whose address it cannot retain.
+func (sm *SessionManager) RegisterSession(bp SessionBlueprint) {
+	owned := bp
+	sm.addSession(&owned)
+}
+
+// addSession is the single construction site for a tracked session (R4), shared by the
+// constructor and RegisterSession so their validation cannot drift.
+func (sm *SessionManager) addSession(bp *SessionBlueprint) {
+	if bp.MaxRounds < 1 && !bp.UnlimitedRounds {
+		panic(fmt.Sprintf("SessionManager.addSession: session %s has MaxRounds=%d, must be >= 1", bp.SessionID, bp.MaxRounds))
+	}
+	var buf *sessionTokenBuffer
+	if bp.ContextGrowth == "accumulate" {
+		buf = newSessionTokenBuffer()
+	}
+	sm.sessions[bp.SessionID] = &activeSession{
+		blueprint: bp,
+		buf:       buf,
+		state:     sessionActive,
+	}
 }
 
 // SetFollowUpBudget sets a global cap on the number of follow-up requests

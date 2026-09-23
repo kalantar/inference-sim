@@ -376,12 +376,50 @@ by `convert otel`); `--trace-header` / `--trace-data` remain the **output**
 observed trace. Corpus-mode (`--concurrent-sessions > 0`) is mutually exclusive
 with the spec-mode inputs (`--workload`, `--workload-spec`, `--rate`,
 `--concurrency`) — a corpus *is* the workload. `--max-concurrency` is
-auto-raised to the pool size if set lower, so the pool is never throttled. The
-pool self-drains all `--total-sessions` sessions (observe bounds the run by the
-session count, not a clock). Because of that self-draining, the spec-mode
-bounding flags `--horizon` and `--num-requests` have no meaning in corpus-mode
-and are rejected rather than silently ignored — size the run with
-`--total-sessions`.
+auto-raised to the pool size if set lower, so the pool is never throttled.
+
+A corpus run is sized in one of **two** ways, and they are mutually exclusive:
+
+- **`--total-sessions N`** — by session count. The pool self-drains all `N`
+  sessions, however long that takes.
+- **`--duration 20m`** — by the clock. Once that much of the measured window has
+  elapsed, sending **stops**: no new sessions, and no further rounds of sessions
+  already in conversation. Requests already on the wire are waited for, not
+  cancelled. Until the bound the session queue is open-ended (the corpus is cycled
+  with cache-busting clones), so it never runs dry.
+
+Use `--duration` when the run length has to be known in advance — picking a
+session count for a 20-minute run means knowing the per-session duration, which
+depends on the server you are measuring, so two arms of one experiment end up
+taking different amounts of time.
+
+Two consequences:
+
+- The trace contains **partial sessions**. A session mid-conversation when the bound
+  fires is recorded only as far as it got, so the output is not a complete session
+  corpus — do not feed it back in as one.
+- Run length is the bound plus however long the last in-flight request takes to
+  answer, so it is tight. (This is the deliberate trade: the alternative — letting
+  in-flight sessions run to completion — keeps every session whole but overshoots by
+  a whole session's remaining rounds, which for a long agentic session is unbounded
+  in practice.)
+
+The bound is measured from the start of the dispatch loop, so it excludes
+`--prewarm-duration` and tokenizer calibration. (The KV-metrics scrape window
+strictly *contains* it — that scrape starts before the loop and ends after the drain.)
+
+The spec-mode bounding flags `--horizon` and `--num-requests` bound *generated*
+arrivals, and a corpus is read from a file rather than generated — so neither has
+any meaning in corpus-mode and both are rejected rather than silently ignored.
+Size the run with `--total-sessions` or `--duration` instead.
+
+```bash
+# The same corpus, bounded to a 20-minute measured window instead of a session count.
+blis observe --server-url http://localhost:8000 --model qwen/qwen3-14b \
+  --corpus-header corpus.yaml --corpus-data corpus.csv \
+  --concurrent-sessions 32 --duration 20m \
+  --trace-header observed.yaml --trace-data observed.csv
+```
 
 `--shuffle-corpus` works in corpus-mode here too, and draws the **same** seeded
 permutation as `blis replay --shuffle-corpus` (both salt the master `--seed`
@@ -424,12 +462,26 @@ blis calibrate --trace-header observed.yaml --trace-data observed.csv \
 
 By default the pool is **self-draining**: it runs until all `--total-sessions`
 sessions complete, regardless of how many waves that takes. For **`blis replay`**
-corpus-mode you may pass `--horizon` to impose a hard wall-clock cap on the
-simulated run — sessions still queued when the cap is reached are reported as
-un-admitted (a warning is logged) rather than silently dropped. **`blis observe`**
-corpus-mode has no such cap: it always self-drains on session count and rejects
-`--horizon` / `--num-requests` (see above), since a live run is bounded by the
-corpus, not a clock.
+corpus-mode you may pass `--horizon` to impose a hard cap on the simulated run —
+sessions still queued when the cap is reached are reported as un-admitted (a
+warning is logged) rather than silently dropped.
+
+**`blis observe`** corpus-mode rejects `--horizon` / `--num-requests` (see above),
+but it can be bounded by the clock with `--duration`. The two bounds differ in
+kind, which is why both exist:
+
+| | `--horizon` (replay only) | `--duration` (observe only) |
+|---|---|---|
+| Clock | simulated | wall-clock, from the start of the dispatch loop |
+| Effect at the bound | the simulation stops | sending stops |
+| Requests in flight | n/a (no real requests) | waited for, not cancelled |
+| Sessions mid-conversation | truncated | truncated (recorded as far as they got) |
+| Run ends | exactly at the bound | bound + the last in-flight request's latency |
+
+Both are hard stops, on different clocks. The difference that matters in practice is
+that `--duration` drains rather than aborting, so every request sent *before the bound*
+is recorded with a real result. An interrupt is different: `Ctrl-C` cancels requests in
+flight, and the run reports that rather than claiming a clean drain.
 
 !!! tip "Subsetting a large corpus: add `--shuffle-corpus`"
     `--total-sessions N` on its own is **deterministic, ordered selection**, not a
@@ -441,6 +493,12 @@ corpus, not a clock.
     `--total-sessions N --shuffle-corpus` yields a seeded-random `N`-of-corpus
     subset, while `--total-sessions ≥ corpus` simply randomizes the admission order
     with every session still running.
+
+    Under `--duration` it depends on whether the bound lasts a full pass over the
+    corpus. A bound long enough for one pass reaches every session (and then starts
+    cloning), so there is no subset to bias. A shorter bound *does* select a prefix in
+    file order, exactly as `--total-sessions N` does — add `--shuffle-corpus` to
+    debias it.
 
 !!! warning "Size the context window to the trace"
     Real agentic traces (e.g. Exgentic `agent-llm-traces`) often carry very large

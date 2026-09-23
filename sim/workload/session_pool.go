@@ -3,24 +3,70 @@ package workload
 import (
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 
 	"github.com/inference-sim/inference-sim/sim"
 )
 
 // SessionPoolDriver keeps a fixed number of closed-loop sessions active. It
 // wraps a SessionManager: intra-session follow-ups are produced by the manager
-// unchanged; when a session reaches a terminal state and queued sessions remain,
-// the driver admits the next queued session's round-0 request. This models a
-// fixed pool of N concurrent "users" drawing from a corpus of captured sessions.
+// unchanged; when a session reaches a terminal state and the pool may admit
+// another, the driver materializes the next session and injects its round-0
+// request. This models a fixed pool of N concurrent "users" drawing from a corpus
+// of captured sessions.
 //
-// Determinism (INV-6): session order is the expansion order of BuildSessionPool
-// (corpus order, then round-robin clones); admission is strictly in that order.
+// The session sequence is VIRTUAL and materialized on demand: index i names the
+// corpus's i-th session while the corpus lasts, and a cache-busting clone of corpus
+// session i%len(corpus) after that. Either a session COUNT ends it (BuildSessionPool's
+// total) or WithOpenEndedQueue leaves it unbounded, in which case the caller decides
+// when to stop — the driver holds no clock.
+//
+// Determinism (INV-6): admission is in virtual-index order and each clone takes
+// exactly one draw from the seeded clone stream, so materializing on demand yields the
+// same sessions as materializing up front.
 type SessionPoolDriver struct {
-	mgr          *SessionManager
-	queued       []*sim.Request // all total round-0 requests (originals + clones), in admission order
-	nextQueued   int            // index into queued of the next session to admit
-	totalStarted int            // sessions injected so far (initial pool + admitted); read by Unstarted()
-	totalCount   int            // total sessions in the pool (== len of all round-0 requests)
+	mgr *SessionManager
+
+	// srcBPs/srcR0 are the caller's (possibly shuffled) corpus, retained and read at
+	// every later admission — so a caller must not reorder or overwrite them.
+	//
+	// Clones are made from cloneTemplates (pristine copies taken at construction), never
+	// from srcR0: a corpus request handed out as a refill is live, and its consumer
+	// mutates State/ProgressIndex/FirstTokenTime in place, so cloning from it after it
+	// has run would produce a clone born already completed.
+	srcBPs         []SessionBlueprint
+	srcR0          []*sim.Request
+	cloneTemplates []sim.Request
+	cloneRNG       *rand.Rand
+	clonesMade     int
+
+	nextIndex int
+	limit     int // sessions in the sequence; 0 = open-ended
+
+	totalStarted    int // sessions injected so far (initial pool + refills)
+	totalTerminated int
+
+	// closed is the one field that crosses goroutines: OnComplete runs on its caller's
+	// completion path while StopAdmitting is called from whatever goroutine decides the
+	// run is over (for `blis observe`, the dispatch loop, not the session serializer).
+	// Everything else here is single-threaded, so this is atomic rather than the whole
+	// driver being locked.
+	closed atomic.Bool
+}
+
+// SessionPoolOption configures a SessionPoolDriver at construction. Variadic so
+// existing call sites are unaffected (R4).
+type SessionPoolOption func(*sessionPoolSettings)
+
+type sessionPoolSettings struct {
+	openEnded bool
+}
+
+// WithOpenEndedQueue drops the session count: the queue keeps cycling the corpus with
+// cache-busting clones and never runs dry, so the caller decides when the run ends.
+// Mutually exclusive with a session-count total.
+func WithOpenEndedQueue() SessionPoolOption {
+	return func(s *sessionPoolSettings) { s.openEnded = true }
 }
 
 // cloneSampler returns a sampler independent of s for stateful sampler types.
@@ -94,16 +140,22 @@ func ShuffleSessions(blueprints []SessionBlueprint, r0Requests []*sim.Request, r
 	}
 }
 
-// BuildSessionPool expands the corpus (blueprints + their round-0 requests) to
-// total via round-robin duplication, registers all sessions with a
-// SessionManager, and returns the driver plus the first concurrent round-0
-// requests to inject at simulation start.
+// BuildSessionPool prepares a pool over the corpus (blueprints + their round-0
+// requests) and returns the driver plus the first concurrent round-0 requests to
+// inject at simulation start. Sessions past the first concurrent ones are
+// materialized on demand as the pool refills.
 //
 // concurrent: max concurrently-active sessions (>= 1).
-// total: total sessions to replay (>= concurrent). If <= len(corpus), the
-// corpus is truncated to total; if greater, clones fill the remainder.
+// total: total sessions to replay (>= concurrent). If <= len(corpus), the corpus is
+// truncated to total; if greater, clones fill the remainder. Pass 0 with
+// WithOpenEndedQueue for an unbounded sequence.
 // seed: master seed for clone RNGs (INV-6).
-func BuildSessionPool(blueprints []SessionBlueprint, r0Requests []*sim.Request, concurrent, total int, seed int64) (*SessionPoolDriver, []*sim.Request, error) {
+func BuildSessionPool(blueprints []SessionBlueprint, r0Requests []*sim.Request, concurrent, total int, seed int64, opts ...SessionPoolOption) (*SessionPoolDriver, []*sim.Request, error) {
+	var settings sessionPoolSettings
+	for _, opt := range opts {
+		opt(&settings)
+	}
+
 	if concurrent < 1 {
 		return nil, nil, fmt.Errorf("concurrent must be >= 1, got %d", concurrent)
 	}
@@ -113,44 +165,77 @@ func BuildSessionPool(blueprints []SessionBlueprint, r0Requests []*sim.Request, 
 	if len(blueprints) != len(r0Requests) {
 		return nil, nil, fmt.Errorf("blueprints (%d) and round-0 requests (%d) count mismatch", len(blueprints), len(r0Requests))
 	}
-	if total < 1 {
-		total = len(blueprints)
-	}
-	if total < concurrent {
-		return nil, nil, fmt.Errorf("total (%d) must be >= concurrent (%d)", total, concurrent)
-	}
 
-	rng := rand.New(rand.NewSource(seed))
-	allBPs := make([]SessionBlueprint, 0, total)
-	allR0 := make([]*sim.Request, 0, total)
-	dupIdx := 0
-	for i := 0; i < total; i++ {
-		srcIdx := i % len(blueprints)
-		if i < len(blueprints) {
-			allBPs = append(allBPs, blueprints[srcIdx])
-			allR0 = append(allR0, r0Requests[srcIdx])
-		} else {
-			dupIdx++
-			bp, r0 := cloneBlueprintForDup(blueprints[srcIdx], r0Requests[srcIdx], dupIdx, rng)
-			allBPs = append(allBPs, bp)
-			allR0 = append(allR0, r0)
+	// A count and an open-ended queue are alternatives, never both (R1).
+	if settings.openEnded {
+		if total > 0 {
+			return nil, nil, fmt.Errorf("a session-count total (%d) and an open-ended queue are mutually exclusive (pass 0 as total with WithOpenEndedQueue)", total)
+		}
+	} else {
+		if total < 1 {
+			total = len(blueprints)
+		}
+		if total < concurrent {
+			return nil, nil, fmt.Errorf("total (%d) must be >= concurrent (%d)", total, concurrent)
 		}
 	}
 
-	mgr := NewSessionManager(allBPs)
-	d := &SessionPoolDriver{
-		mgr:        mgr,
-		queued:     allR0,
-		totalCount: total,
+	// Validate up front: lazy materialization would otherwise defer a malformed
+	// blueprint's panic into mid-run. Clones inherit MaxRounds, so this covers them.
+	for i := range blueprints {
+		if blueprints[i].MaxRounds < 1 && !blueprints[i].UnlimitedRounds {
+			return nil, nil, fmt.Errorf("session %s has MaxRounds=%d, must be >= 1", blueprints[i].SessionID, blueprints[i].MaxRounds)
+		}
 	}
+
+	// Pristine clone templates (see SessionPoolDriver.cloneTemplates).
+	cloneTemplates := make([]sim.Request, len(r0Requests))
+	for i, r := range r0Requests {
+		cloneTemplates[i] = *r
+	}
+
+	d := &SessionPoolDriver{
+		mgr:            NewSessionManager(nil),
+		srcBPs:         blueprints,
+		srcR0:          r0Requests,
+		cloneTemplates: cloneTemplates,
+		cloneRNG:       rand.New(rand.NewSource(seed)),
+		limit:          total, // 0 when open-ended
+	}
+
 	// Inject the first concurrent sessions immediately.
 	initial := make([]*sim.Request, 0, concurrent)
 	for i := 0; i < concurrent; i++ {
-		initial = append(initial, d.queued[d.nextQueued])
-		d.nextQueued++
-		d.totalStarted++
+		req, ok := d.admitNext()
+		if !ok {
+			break
+		}
+		initial = append(initial, req)
 	}
 	return d, initial, nil
+}
+
+// admitNext materializes and registers the next session and returns its round-0
+// request, or ok=false when a counted sequence is exhausted (an open-ended one never is).
+func (d *SessionPoolDriver) admitNext() (*sim.Request, bool) {
+	if d.limit > 0 && d.nextIndex >= d.limit {
+		return nil, false
+	}
+	i := d.nextIndex
+	srcIdx := i % len(d.srcBPs)
+
+	var bp SessionBlueprint
+	var r0 *sim.Request
+	if i < len(d.srcBPs) {
+		bp, r0 = d.srcBPs[srcIdx], d.srcR0[srcIdx]
+	} else {
+		d.clonesMade++
+		bp, r0 = cloneBlueprintForDup(d.srcBPs[srcIdx], &d.cloneTemplates[srcIdx], d.clonesMade, d.cloneRNG)
+	}
+	d.mgr.RegisterSession(bp)
+	d.nextIndex++
+	d.totalStarted++
+	return r0, true
 }
 
 // isSessionRequest reports whether a completion drove its session to a terminal
@@ -160,9 +245,10 @@ func BuildSessionPool(blueprints []SessionBlueprint, r0Requests []*sim.Request, 
 // request => the session just terminated.
 func isSessionRequest(req *sim.Request) bool { return req.SessionID != "" }
 
-// OnComplete wraps SessionManager.OnComplete. When the inner manager terminates
-// a session (returns no follow-up for a session request) and queued sessions
-// remain, the driver admits the next session's round-0 request to refill the pool.
+// OnComplete wraps SessionManager.OnComplete. When the inner manager terminates a
+// session (returns no follow-up for a session request), the driver admits the next
+// session to refill the pool — unless a clock bound has been reached, or the
+// counted sequence is exhausted.
 func (d *SessionPoolDriver) OnComplete(req *sim.Request, tick int64) []*sim.Request {
 	followUps := d.mgr.OnComplete(req, tick)
 	if !isSessionRequest(req) {
@@ -172,34 +258,63 @@ func (d *SessionPoolDriver) OnComplete(req *sim.Request, tick int64) []*sim.Requ
 		// Session continues (intra-session follow-up). Pool membership unchanged.
 		return followUps
 	}
-	// Session terminated. Admit the next queued session, if any, to refill the pool.
 	// The pool bound is maintained structurally: each termination admits at most one
 	// replacement, so the concurrently-active count never exceeds the initial pool.
-	if d.nextQueued < len(d.queued) {
-		next := d.queued[d.nextQueued]
-		// Admit at the completion tick (a fresh user starts as this one ends).
-		// Deadline is an ABSOLUTE timestamp on the same clock origin as ArrivalTime,
-		// so rebasing arrival to `tick` without shifting the deadline would leave a
-		// stale past deadline on every wave-2+ session — instantly dropped on enqueue
-		// (simulator.go deadline guard), mass-cancelling the pool. Preserve the
-		// recorded deadline-relative-to-arrival gap by shifting the deadline by the
-		// same offset. (OTel corpora set no deadline; run/observe corpora do.)
-		if next.Deadline > 0 {
-			next.Deadline += tick - next.ArrivalTime
-		}
-		next.ArrivalTime = tick
-		d.nextQueued++
-		d.totalStarted++
-		return []*sim.Request{next}
+	d.totalTerminated++
+
+	if d.closed.Load() {
+		return nil
 	}
-	return nil
+	next, ok := d.admitNext()
+	if !ok {
+		return nil
+	}
+	// Admit at the completion tick (a fresh user starts as this one ends).
+	// Deadline is an ABSOLUTE timestamp on the same clock origin as ArrivalTime,
+	// so rebasing arrival to `tick` without shifting the deadline would leave a
+	// stale past deadline on every wave-2+ session — instantly dropped on enqueue
+	// (simulator.go deadline guard), mass-cancelling the pool. Preserve the
+	// recorded deadline-relative-to-arrival gap by shifting the deadline by the
+	// same offset. (OTel corpora set no deadline; run/observe corpora do.)
+	if next.Deadline > 0 {
+		next.Deadline += tick - next.ArrivalTime
+	}
+	next.ArrivalTime = tick
+	return []*sim.Request{next}
 }
 
-// TotalSessions returns the total number of sessions in the pool (after duplication).
-func (d *SessionPoolDriver) TotalSessions() int { return d.totalCount }
+// TotalSessions returns the number of sessions in the pool: the configured total for a
+// counted pool, or — for an open-ended one, whose size is only known at the end — the
+// number actually started.
+func (d *SessionPoolDriver) TotalSessions() int {
+	if d.limit > 0 {
+		return d.limit
+	}
+	return d.totalStarted
+}
 
-// Unstarted returns the number of sessions never admitted. It is nonzero when
-// either (a) a hard --horizon cap ends the run with sessions still queued, or
+// StopAdmitting tells the driver that nothing further will be dispatched, so a session
+// terminating from here on must not cause another to be admitted. Without it a caller
+// that stops sending while requests are still in flight would keep admitting
+// replacements it can never send, inflating SessionsStarted() by up to the pool size.
+// Idempotent, and safe to call from a different goroutine than the one driving
+// OnComplete — which is the normal case, since the decision to stop belongs to whatever
+// owns the run rather than to the completion path.
+func (d *SessionPoolDriver) StopAdmitting() { d.closed.Store(true) }
+
+// SessionsStarted returns the number of sessions injected (initial pool + refills).
+// For an open-ended queue this is the run's realized size, not known in advance.
+func (d *SessionPoolDriver) SessionsStarted() int { return d.totalStarted }
+
+// SessionsTerminated returns the number of started sessions that reached a terminal
+// state. A shortfall against SessionsStarted() means sessions ended in flight — the
+// anomaly Unstarted() reports for a counted pool but cannot see for an open-ended one,
+// where nothing is ever queued-but-unadmitted (INV-11).
+func (d *SessionPoolDriver) SessionsTerminated() int { return d.totalTerminated }
+
+// Unstarted returns the number of sessions never admitted. For a COUNT-bounded pool it
+// is nonzero when either (a) a hard --horizon cap ends the run with sessions still
+// queued (replay only — observe rejects --horizon), or
 // (b) an admitted session's request left the pipeline before reaching an instance
 // (routing rejection, gateway shed/evict/expire) — OnRequestDone is wired
 // per-instance, so those pre-instance drops never terminate the session and its
@@ -207,17 +322,7 @@ func (d *SessionPoolDriver) TotalSessions() int { return d.totalCount }
 // --horizon set. The caller logs a warning and reports this alongside totalStarted
 // so accounting stays closed: totalStarted + Unstarted() == TotalSessions()
 // (INV-11 / INV-1).
-func (d *SessionPoolDriver) Unstarted() int { return d.totalCount - d.totalStarted }
-
-// hasUniqueSessionIDs is a test helper: true iff all pooled round-0 requests
-// carry distinct SessionIDs.
-func (d *SessionPoolDriver) hasUniqueSessionIDs() bool {
-	seen := make(map[string]struct{}, len(d.queued))
-	for _, r := range d.queued {
-		if _, dup := seen[r.SessionID]; dup {
-			return false
-		}
-		seen[r.SessionID] = struct{}{}
-	}
-	return true
-}
+//
+// Always 0 for an open-ended queue: sessions are materialized at admission, so one
+// never admitted is never created. Use SessionsTerminated() vs SessionsStarted() there.
+func (d *SessionPoolDriver) Unstarted() int { return d.TotalSessions() - d.totalStarted }

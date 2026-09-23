@@ -4,10 +4,25 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"time"
 
 	"github.com/inference-sim/inference-sim/sim"
 	"github.com/inference-sim/inference-sim/sim/workload"
 )
+
+// countSessionsWithRecords counts distinct sessions with at least one recorded request.
+// The pool admits a session before anything is dispatched, so "started" alone cannot
+// tell a session truncated mid-conversation from one the bound stopped before its first
+// round went out — only the former was "recorded as far as it got".
+func countSessionsWithRecords(records []workload.TraceRecord) int {
+	seen := make(map[string]struct{}, len(records))
+	for _, r := range records {
+		if r.SessionID != "" {
+			seen[r.SessionID] = struct{}{}
+		}
+	}
+	return len(seen)
+}
 
 // validateObserveCorpusFlags enforces the spec-mode vs corpus-mode split for
 // blis observe. Corpus-mode is selected by --concurrent-sessions > 0 (or a
@@ -16,6 +31,11 @@ import (
 // flag combination is valid, else a human-readable error for logrus.Fatalf.
 func validateObserveCorpusFlags(
 	concurrentSessions, totalSessions int,
+	// totalSessionsSupplied distinguishes an unset --total-sessions from an explicit
+	// 0, which is a documented, meaningful value ("replay each corpus session once").
+	// The one-of against --duration turns on supplied-ness, not on the value, so
+	// supplying 0 alongside --duration is a conflict rather than a silent override.
+	totalSessionsSupplied bool,
 	corpusHeader, corpusData string,
 	workload, workloadSpec string,
 	rateChanged bool,
@@ -26,6 +46,7 @@ func validateObserveCorpusFlags(
 	horizonChanged bool,
 	numRequestsChanged bool,
 	shuffleCorpus bool,
+	duration time.Duration,
 ) string {
 	corpusFilesSet := corpusHeader != "" || corpusData != ""
 	corpusMode := concurrentSessions > 0
@@ -33,6 +54,11 @@ func validateObserveCorpusFlags(
 	// --total-sessions is meaningless without a pool.
 	if totalSessions != 0 && !corpusMode {
 		return "--total-sessions requires --concurrent-sessions > 0"
+	}
+	// --duration bounds a corpus run by stopping the dispatch loop. Spec-mode has no
+	// pool; its generation is bounded by --num-requests / --horizon instead.
+	if duration != 0 && !corpusMode {
+		return "--duration requires --concurrent-sessions > 0"
 	}
 	// Corpus files supplied but pool not enabled.
 	if corpusFilesSet && !corpusMode {
@@ -50,6 +76,17 @@ func validateObserveCorpusFlags(
 	// Corpus-mode: both files required.
 	if corpusHeader == "" || corpusData == "" {
 		return "corpus-mode (--concurrent-sessions > 0) requires both --corpus-header and --corpus-data"
+	}
+	// A run is sized EITHER by session count or by the clock, never both: the count
+	// says how many sessions to run, the duration says how long to keep starting
+	// them, and honouring both would leave the end reason ambiguous. Reject rather
+	// than silently letting one win (R1).
+	if duration != 0 && totalSessionsSupplied {
+		return "--duration and --total-sessions are mutually exclusive (corpus-mode): --total-sessions bounds the run by session count, --duration bounds it by the clock (after that long, stop sending entirely \u2014 no new sessions and no further rounds \u2014 then wait for the requests already on the wire). Pick one."
+	}
+	// A negative bound is meaningless; name the sign rather than the resolution.
+	if duration < 0 {
+		return fmt.Sprintf("--duration must be positive, got %s", duration)
 	}
 	// Corpus-mode: reject every spec-mode input.
 	if concurrency > 0 {
@@ -78,29 +115,31 @@ func validateObserveCorpusFlags(
 	if lazyGeneration {
 		return "--lazy-generation is invalid with --concurrent-sessions (corpus-mode): the corpus is loaded directly; there is no spec generator to stream"
 	}
-	// --horizon / --num-requests bound spec-mode generation. Corpus-mode self-drains
-	// on session count (sized by --total-sessions), so neither has any effect here —
-	// reject them loudly rather than silently ignore (R1, no silent no-op).
+	// --horizon / --num-requests bound spec-mode GENERATION, and corpus-mode generates
+	// nothing — the corpus is read from a file. So neither has any effect here; reject
+	// them loudly rather than silently ignore (R1, no silent no-op). The refusals name
+	// the two flags that DO size a corpus run, since an operator reaching for --horizon
+	// wants a run length and would otherwise be told only what does not work.
 	if horizonChanged {
-		return "--horizon is invalid with --concurrent-sessions (corpus-mode): the pool self-drains on session count; size the run with --total-sessions"
+		return "--horizon is invalid with --concurrent-sessions (corpus-mode): it bounds generated arrivals, and a corpus is read from a file. Size the run with --total-sessions (session count) or --duration (clock)"
 	}
 	if numRequestsChanged {
-		return "--num-requests is invalid with --concurrent-sessions (corpus-mode): the corpus and --total-sessions determine the request count"
+		return "--num-requests is invalid with --concurrent-sessions (corpus-mode): the request count follows from the corpus and how the run is sized — use --total-sessions (session count) or --duration (clock)"
 	}
 	return ""
 }
 
-// buildObserveCorpusPool loads a TraceV2 corpus and constructs the session pool
-// that drives corpus-mode observe. The horizon passed to the blueprint loader is
-// unbounded (math.MaxInt64): observe's dispatch loop drains on active-session
-// count, not a wall-clock horizon, so the pool self-drains all `total` sessions
-// (mirrors blis replay's self-draining default). Returns the driver and the
-// initial `concurrent` round-0 requests to seed the dispatch loop.
+// buildObserveCorpusPool loads a TraceV2 corpus and constructs the session pool that
+// drives corpus-mode observe. The blueprint loader always gets an unbounded horizon
+// (math.MaxInt64): the run is bounded at the CLI, not in the loader — by session count
+// (the pool self-drains all `total`, mirroring replay's default) or, when openEnded is
+// set, by --duration, which the dispatch loop enforces by stopping sending.
 func buildObserveCorpusPool(
 	corpusHeader, corpusData string,
 	concurrentSessions, totalSessions int,
 	shuffleCorpus bool,
 	seed int64,
+	openEnded bool,
 ) (*workload.SessionPoolDriver, []*sim.Request, error) {
 	trace, err := workload.LoadTraceV2(corpusHeader, corpusData)
 	if err != nil {
@@ -132,7 +171,11 @@ func buildObserveCorpusPool(
 	if shuffleCorpus {
 		workload.ShuffleSessions(blueprints, r0Requests, rand.New(rand.NewSource(seed^corpusShuffleSeedSalt)))
 	}
-	driver, initial, err := workload.BuildSessionPool(blueprints, r0Requests, concurrentSessions, totalSessions, seed)
+	var opts []workload.SessionPoolOption
+	if openEnded {
+		opts = append(opts, workload.WithOpenEndedQueue())
+	}
+	driver, initial, err := workload.BuildSessionPool(blueprints, r0Requests, concurrentSessions, totalSessions, seed, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("building session pool: %w", err)
 	}

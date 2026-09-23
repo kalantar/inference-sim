@@ -1,6 +1,7 @@
 package workload
 
 import (
+	"fmt"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -48,7 +49,7 @@ func TestSession_AccumulateMalformedTrace_PrefixLongerThanInput(t *testing.T) {
 	outputR0 := []sim.TokenID{91, 92}
 	req0 := &sim.Request{
 		ID: "r0", SessionID: "sess-malformed", RoundIndex: 0,
-		State:         sim.StateCompleted,
+		State: sim.StateCompleted,
 		ProgressIndex: int64(len(inputR0) + len(outputR0)), // 3+2 = 5
 		InputTokens:   inputR0,
 		OutputTokens:  outputR0,
@@ -177,7 +178,7 @@ func TestSession_AccumulateOverCap_CancelsSession(t *testing.T) {
 	// OutputTokens has only 5 → triggers the over-cap case (10 > 5).
 	req0 := &sim.Request{
 		ID: "r0", SessionID: "sess-overcap", RoundIndex: 0,
-		State:         sim.StateCompleted,
+		State: sim.StateCompleted,
 		ProgressIndex: 20,
 		InputTokens:   make([]sim.TokenID, 10),
 		OutputTokens:  make([]sim.TokenID, 5),
@@ -227,7 +228,7 @@ func TestSession_AccumulateDeterminism_ClosedLoop(t *testing.T) {
 		seedR0 := rand.New(rand.NewSource(seed + 1))
 		req := &sim.Request{
 			ID: "r0", SessionID: "sess-determinism", RoundIndex: 0,
-			State:         sim.StateCompleted,
+			State: sim.StateCompleted,
 			InputTokens:   sim.GenerateRandomTokenIDs(seedR0, 8),
 			OutputTokens:  sim.GenerateRandomTokenIDs(seedR0, 4),
 			ProgressIndex: 12,
@@ -423,7 +424,7 @@ func TestSession_AccumulateDoesNotReseed(t *testing.T) {
 	// should extend exactly once for output + new input, not re-seed.
 	req1 := &sim.Request{
 		ID: "r1", SessionID: "sess-no-reseed", RoundIndex: 1,
-		State: sim.StateCompleted,
+		State:         sim.StateCompleted,
 		ProgressIndex: int64(len(r1.InputTokens) + len(r1.OutputTokens)),
 		InputTokens: r1.InputTokens, OutputTokens: r1.OutputTokens,
 	}
@@ -471,7 +472,7 @@ func TestSession_AccumulateSharesBackingArray(t *testing.T) {
 
 	req1 := &sim.Request{
 		ID: "r1", SessionID: "sess-share", RoundIndex: 1,
-		State: sim.StateCompleted,
+		State:         sim.StateCompleted,
 		ProgressIndex: int64(len(r1.InputTokens) + len(r1.OutputTokens)),
 		InputTokens: r1.InputTokens, OutputTokens: r1.OutputTokens,
 	}
@@ -634,7 +635,7 @@ func TestSession_ContextAccumulation_MultiStep(t *testing.T) {
 
 	req1 := &sim.Request{
 		ID: "r1", SessionID: "sess-accum3", RoundIndex: 1,
-		State: sim.StateCompleted,
+		State:         sim.StateCompleted,
 		ProgressIndex: int64(len(follow1[0].InputTokens) + len(follow1[0].OutputTokens)), // 25 + 5 = 30
 		InputTokens: follow1[0].InputTokens, OutputTokens: follow1[0].OutputTokens,
 	}
@@ -656,6 +657,7 @@ func TestSession_ContextAccumulation_MultiStep(t *testing.T) {
 // from round-0's InputTokens, and once from the prefix-prepend block).
 //
 // Invariant: len(round1.InputTokens) == len(prefix) + len(input0) + len(output0) + len(newInput1)
+//
 //            = 5 + 10 + 5 + 10 = 30, not 35.
 func TestSession_ContextAccumulation_WithPrefix(t *testing.T) {
 	bp := makeTestBlueprint("sess-prefix", 3, 1000, "accumulate", 1_000_000)
@@ -1005,6 +1007,75 @@ func TestNewSessionManager_PanicsOnZeroMaxRounds(t *testing.T) {
 	}()
 	bp := makeTestBlueprint("bad", 0, 1000, "", 1_000_000)
 	NewSessionManager([]SessionBlueprint{bp})
+}
+
+// completeRound0 drives one session's round-0 completion through the manager and
+// returns the follow-ups. Shared by the RegisterSession tests below.
+func completeRound0(sm *SessionManager, sessionID string, tick int64) []*sim.Request {
+	return sm.OnComplete(&sim.Request{
+		ID: "r_" + sessionID, SessionID: sessionID, RoundIndex: 0,
+		State: sim.StateCompleted, ProgressIndex: 15,
+		InputTokens: make([]sim.TokenID, 10), OutputTokens: make([]sim.TokenID, 5),
+	}, tick)
+}
+
+// TestRegisterSession_MakesSessionDrivable is the law the on-demand session queue
+// needs: a session added AFTER construction is driven exactly like one supplied to
+// the constructor, so a clone produced at admission time can generate its own
+// follow-up rounds.
+func TestRegisterSession_MakesSessionDrivable(t *testing.T) {
+	sm := NewSessionManager(nil)
+	sm.RegisterSession(makeTestBlueprint("late", 2, 1000, "", 1_000_000))
+
+	follow := completeRound0(sm, "late", 5000)
+	if len(follow) != 1 {
+		t.Fatalf("late-registered session produced %d follow-ups, want 1", len(follow))
+	}
+	if follow[0].SessionID != "late" {
+		t.Errorf("follow-up SessionID = %q, want \"late\"", follow[0].SessionID)
+	}
+	if follow[0].RoundIndex != 1 {
+		t.Errorf("follow-up RoundIndex = %d, want 1", follow[0].RoundIndex)
+	}
+}
+
+// TestRegisterSession_PanicsOnZeroMaxRounds pins that late registration enforces
+// the SAME MaxRounds validation as the constructor. Without this the two entry
+// points would disagree and a malformed blueprint could slip in unvalidated.
+func TestRegisterSession_PanicsOnZeroMaxRounds(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for MaxRounds=0 on RegisterSession, got none")
+		}
+	}()
+	sm := NewSessionManager(nil)
+	sm.RegisterSession(makeTestBlueprint("bad-late", 0, 1000, "", 1_000_000))
+}
+
+// TestRegisterSession_DoesNotDisturbEarlierSessions guards the aliasing hazard:
+// NewSessionManager stores POINTERS to the blueprints it is given, so a
+// registration path that appended to that same backing array would reallocate it
+// and silently orphan every session registered earlier. Registering many sessions
+// and then driving the FIRST one catches that — an orphaned blueprint yields the
+// wrong round count or a missing session.
+func TestRegisterSession_DoesNotDisturbEarlierSessions(t *testing.T) {
+	// A 2-round first session, supplied to the constructor in a slice whose
+	// capacity is deliberately tight so any append would reallocate.
+	initial := []SessionBlueprint{makeTestBlueprint("first", 2, 1000, "", 1_000_000)}
+	sm := NewSessionManager(initial)
+
+	for i := 0; i < 64; i++ {
+		sm.RegisterSession(makeTestBlueprint(fmt.Sprintf("later-%d", i), 2, 1000, "", 1_000_000))
+	}
+
+	follow := completeRound0(sm, "first", 5000)
+	if len(follow) != 1 {
+		t.Fatalf("first session produced %d follow-ups after 64 later registrations, want 1 "+
+			"(its blueprint was orphaned by a reallocation)", len(follow))
+	}
+	if follow[0].SessionID != "first" {
+		t.Errorf("follow-up SessionID = %q, want \"first\"", follow[0].SessionID)
+	}
 }
 
 func TestSession_UnlimitedRounds_ContinuesPastMaxRounds(t *testing.T) {
