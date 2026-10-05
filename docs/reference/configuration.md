@@ -68,8 +68,8 @@ All internal timestamps in the DES (arrival time, schedule time, completion time
 | `--admission-latency`, `--routing-latency` | ticks (μs) | Decision latency injected into the DES event queue |
 | `think_time_us` (workload YAML) | microseconds | Inter-round delay in multi-turn sessions. 5,000,000 = 5 seconds |
 | `aggregate_rate`, `--rate` | requests/second | Not ticks — real-world time unit |
-| `--kv-transfer-bandwidth` | blocks/tick | Transfer rate between GPU and CPU KV tiers |
-| `--kv-transfer-base-latency` | ticks (μs) | Fixed per-transfer overhead |
+| `--kv-transfer-bandwidth` | tokens/tick | Transfer rate between GPU and CPU KV tiers on the legacy `--kv-cpu-blocks` path. Unset ⇒ **derived** from the catalog `cpu_dram` device (#1819) |
+| `--kv-transfer-base-latency` | ticks (μs) | Fixed per-block overhead on the legacy CPU tier. Unset ⇒ derived from `cpu_dram.base_latency`; explicit `0` disables it |
 
 ### Common Pitfalls
 
@@ -107,8 +107,8 @@ Controls GPU and CPU memory simulation for key-value cache blocks. Maps to `KVCa
 | `--block-size-in-tokens` | int64 | 16 | Tokens per KV block. |
 | `--kv-cpu-blocks` | int64 | 0 | CPU-tier blocks. 0 disables tiered caching. |
 | `--kv-offload-threshold` | float64 | 0.9 | GPU utilization fraction above which blocks are offloaded to CPU. Range [0, 1]. |
-| `--kv-transfer-bandwidth` | float64 | 100.0 | GPU-CPU transfer rate in blocks/tick. Required > 0 when CPU blocks > 0. |
-| `--kv-transfer-base-latency` | int64 | 0 | Fixed per-transfer latency in ticks. |
+| `--kv-transfer-bandwidth` | float64 | unset ⇒ derive | GPU↔CPU transfer rate in tokens/tick for the legacy `--kv-cpu-blocks` tier. Omit it to derive from `cpu_dram.read_bandwidth` with the R2G3b residual; supply a finite positive value to override it. A rate whose per-block charge exceeds the safe tick budget is refused. Passing `0` is invalid, not a request to derive. |
+| `--kv-transfer-base-latency` | int64 | unset ⇒ derive | Fixed per-block latency in ticks. Omit it to derive from `cpu_dram.base_latency` (microseconds rounded up to whole ticks); an explicitly supplied `0` is a valid independent override. If either transfer flag is omitted, `<catalog>/devices/storage.yaml` must define `cpu_dram`; if both are supplied, the table is not read. Combined and cumulative transfer-latency additions are checked against `int64`. |
 
 \* The effective value of `--total-kv-blocks` follows a 3-layer resolution: (1) explicit `--total-kv-blocks` CLI flag, (2) auto-calculation from model architecture and GPU memory via `CalculateKVBlocks` (for all backends when `config.json` and `MemoryGiB` are available), (3) hardcoded default of 1,000,000 blocks. See [Resolution Process](#resolution-process) for details.
 
@@ -147,7 +147,7 @@ Maps to `ModelHardwareConfig`.
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--model` | string | (required) | LLM model name (e.g., `qwen/qwen3-14b`). |
-| `--hardware` | string | "" | **Required** GPU type (`run` and `replay`). Bundled options: `H100`, `A100-SXM`, `A100-80`. Never loaded from `defaults.yaml` — omitting it is refused naming the flag (NS-6, #1733). Add new GPUs to `hardware_config.json` (include `IntraNodeBwGBps`/`InterNodeBwGBps` if instances on that GPU may span nodes — see [Interconnect Calibration](#interconnect-calibration)). |
+| `--hardware` | string | "" | **Required** GPU type (`run` and `replay`). Bundled options: `H100`, `H200`, `A100-SXM`, `A100-80`, `L40S` (the full set of `hardware_config.json` entries — see [Generalization Scope](../guide/latency-models.md#generalization-scope) for each one's specs). Never loaded from `defaults.yaml` — omitting it is refused naming the flag (NS-6, #1733). Add new GPUs to `hardware_config.json` (include `IntraNodeBwGBps`/`InterNodeBwGBps` if instances on that GPU may span nodes — see [Interconnect Calibration](#interconnect-calibration)). |
 | `--tp` | int | 0 | **Required** tensor parallelism degree, > 0 (`run` and `replay`). Never loaded from `defaults.yaml` — omitting it is refused naming the flag (NS-6, #1733). |
 | `--dp` | int | 1 | Data parallelism degree (MoE models only; `--latency-model trained-physics` only). `--dp N` spawns N real single-node engine replicas per `--num-instances`, each sized per-rank (`DP=1`) — on both `blis run` (#1531) and `blis replay` (#1556); re-supply it identically on replay — the TraceV2 header has no `data_parallel` field at all, and replay reads no parallelism field back from it, so omitting `--dp` on the replay leg silently compares an N-replica run against a 1-replica replay. Supported with `--enable-expert-parallel` since #1548 (the EP group is those same replicas' GPUs; re-supply both flags on replay). Supported with PD disaggregation (each pool spawns N per-rank replicas) and node pools (N×M replicas reserve N×M×TP GPUs, each sized per-rank) since #1553. Rejected with the model autoscaler (#1553: dp-group co-scaling is undefined). |
 | `--enable-expert-parallel` | bool | false | Enable expert parallelism for MoE models (mirrors vLLM `--enable-expert-parallel`; `--latency-model trained-physics` only). Since #1548 it affects **step time** (routed-expert weights shard across the `TP·DP` EP group; the MoE FFN dispatch/combines instead of all-reducing) as well as KV-capacity sizing (#1656), and is supported alongside `--dp > 1`. Reserves no GPUs beyond those `--dp` placement already takes. |
@@ -155,6 +155,7 @@ Maps to `ModelHardwareConfig`.
 | `--prefill-moe-comm-backend` | string | "" | Per-role MoE all-to-all backend for prefill pool instances (`""` = inherit `--moe-comm-backend`). Mirrors `VLLM_ALL2ALL_BACKEND` being per-process, so prefill and decode engines can run different modes (#1548). |
 | `--decode-moe-comm-backend` | string | "" | Per-role MoE all-to-all backend for decode pool instances (`""` = inherit `--moe-comm-backend`) (#1548). |
 | `--max-model-len` | int64 | 0 | Max total sequence length (input + output) in tokens. 0 = unlimited. Mirrors vLLM's `--max-model-len`. Auto-derived from `max_position_embeddings` in HuggingFace `config.json` for roofline/trained-physics backends. Applies `rope_scaling` factor for types `linear`, `dynamic`, `yarn`, `default`, `mrope`; excludes `su`, `longrope`, `llama3`; skips entirely for `gemma3` models. Capped at KV-feasible maximum. |
+| `--no-enable-prefix-caching` | bool | false | Disable cross-request GPU prefix reuse, mirroring vLLM's `--no-enable-prefix-caching`. Default false means prefix caching remains enabled (INV-6). The flag affects batch-formation work only; CPU/offload reload remains independent. Re-supply it identically on `replay` for INV-13; it is not persisted in the TraceV2 header. |
 
 ### Roofline Mode
 
@@ -616,6 +617,8 @@ Before any backend-specific logic runs, BLIS requires the deployment: `--hardwar
 2. **Auto-calculation** (all backends) — when `MemoryGiB > 0` in the hardware config and `config.json` is available, `CalculateKVBlocks` derives the block count from model architecture and GPU memory. BLIS resolves `config.json` as the catalog entry `<catalog>/models/<short-name>/config.json` (transition fallback: the flat `<catalog>/<short-name>/config.json`, #1774) inside the catalog located by `--catalog` / `BLIS_CATALOG`; there is no step outside that catalog root — an uncatalogued model is refused rather than fetched (NS-6). Failure modes: (a) if `MemoryGiB` is missing from `hardware_config.json`, BLIS warns and falls back to the hardcoded default (layer 3); (b) if model architecture params cannot be extracted from `config.json`, BLIS warns and falls back to the hardcoded default; (c) if the calculation itself fails (e.g., an unsupported activation function), `CalculateKVBlocks` returns an error and BLIS **aborts with a fatal error** (`logrus.Fatalf`) rather than falling back. Auto-calculation currently requires SwiGLU-family activations (`silu`, `swiglu`, `geglu`, `situ` — Kimi-K3's SiTU-GLU, a 3-matrix gated GLU with SwiGLU's weight/FLOP shape); a model with another activation (e.g., Falcon's `gelu`) therefore aborts the run during auto-calculation unless `--total-kv-blocks` is set explicitly (which skips auto-calculation)
 3. **Hardcoded default** — 1,000,000 (CLI flag default, used when auto-calculation is unavailable or fails)
 
+Auto-calculation divides an **aggregate** memory budget (`gpu_mem × util × TP`, less the weight, activation, non-torch and LoRA-reservation overheads) by the **aggregate** cost of one block (`per_GPU_KV_bytes_per_token × block_size × TP`) — blocks are global, and each of the TP ranks stores its shard of every block. Before #1846 the denominator was the per-GPU cost alone, which over-estimated the pool by ~TP on every multi-GPU deployment (TP=1 was unaffected). This is an analytical estimate in vLLM's units, not a reproduction of vLLM's per-rank memory profiling, and remains slightly optimistic at high TP. The formula, the measured residual, and when to pin `--total-kv-blocks` instead are in [KV Cache Management](../guide/kv-cache.md#how-the-auto-calculated-pool-is-sized).
+
 !!! note "Per-instance capacity with mixed-GPU node pools (#1522)"
     When `node_pools` are configured (via `--policy-config`) and `--total-kv-blocks` is **not** explicitly set, each placed instance auto-calculates KV capacity from its **own** pool's `gpu_memory_gib` — not the single global `--hardware` GPU. So an H100 pool (80 GiB) and an L40S pool (48 GiB) serving the same role get different block counts. This applies to startup placement, deferred placement (nodes provisioned after start), and autoscaler-created instances. An explicit `--total-kv-blocks` disables this and forces a uniform global capacity across all instances (layer 1 above wins). A per-GPU capacity smaller than `--max-model-len` auto-caps that instance's `max-model-len` to the KV-feasible maximum. If a pool's memory is unavailable or the calc fails, that instance falls back to the global capacity with a warning. Node pools are `blis run` only.
 
@@ -680,9 +683,11 @@ Rules:
   like every other BLIS config file: a key that is not one of the fields below fails the
   load with an error naming the key *and* the GPU entry it appears under, instead of
   leaving the intended field at 0 (a plausible-but-wrong bandwidth, MFU or memory
-  capacity). Two documentation-only keys are accepted and ignored — `_comment` and
+  capacity). Three documentation-only keys are accepted and ignored — `_comment` and
   `_comment_interconnect`, which the bundled file uses to record calibration provenance
-  next to the numbers. Keys must be spelled canonically: a key differing only in letter
+  next to the numbers, plus `Provenance`, the structured provenance tag catalog `hardware/`
+  entries carry (R2H2, blis-catalog#10); its enum value is validated by the catalog CI gate,
+  not by this loader. Keys must be spelled canonically: a key differing only in letter
   case (`IntraNodeBwGbps`) is also rejected, with the canonical spelling named. Valid
   keys: `TFlopsPeak`, `TFlopsFP8`, `BwPeakTBs`, `mfuPrefill`, `mfuDecode`, `MemoryGiB`,
   `IntraNodeBwGBps`, `InterNodeBwGBps`, `InterNodeHopLatencyUs`.
@@ -714,6 +719,22 @@ Rules:
 
 To compare fabrics, change `InterNodeBwGBps` (a slower fabric never lowers the charged
 cost), or give pools distinct `gpu_type` entries with different values.
+
+!!! note "The catalog's `networks/` fabric classes state bandwidth, not a PD-transfer base latency"
+    The catalog's reusable fabric classes (`<catalog>/networks/*.yaml` — `ethernet-100gbe`,
+    `ib-400g`, `roce-200g`) state a nominal `InterNodeBwGBps`, and that figure **is** the
+    PD-transfer bandwidth: there is no separate PD bandwidth number
+    ([blis-catalog#10](https://github.com/inference-sim/blis-catalog/pull/10)). They carry **no**
+    `PDTransferBaseLatencyMs` — [blis-catalog#12](https://github.com/inference-sim/blis-catalog/pull/12)
+    removed it, because a fabric class has no inherent per-transfer base latency to state (the
+    nominal value was always a `0` placeholder), and the fabric schema is *closed*, so the catalog
+    CI gate now rejects the key as unknown. The PD-transfer base latency is a **modeling
+    estimate**, supplied by `--pd-transfer-base-latency` (default `0.05` ms) and owned by
+    [`blis-registry`](https://github.com/inference-sim/blis-registry/issues/10) (`method: assumed`);
+    the effective value is that number alone, with no catalog `0` to compose with. BLIS has no
+    `networks/` reader yet (nothing reads a fabric file today) — `cmd/catalog_networks_fabric_test.go`
+    guards the rule so the reader cannot be written against the retired field
+    ([#1838](https://github.com/inference-sim/inference-sim/issues/1838)).
 
 !!! note "Node-pool instances use the `--hardware` entry"
     A node-pool instance is calibrated from whichever `hardware_config.json` entry

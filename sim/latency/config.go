@@ -353,7 +353,21 @@ func parseHWConfig(HWConfigFilePath string) (map[string]sim.HardwareCalib, error
 	if err != nil {
 		return nil, fmt.Errorf("read hardware config %q: %w", HWConfigFilePath, err)
 	}
+	return ParseHardwareCalibEntries(data)
+}
 
+// ParseHardwareCalibEntries strictly decodes a hardware-config PAYLOAD — a JSON object of
+// GPU name -> calibration — into HardwareCalib entries. parseHWConfig is this function plus
+// a file read, so the bundled hardware_config.json and any other caller share one decode and
+// one strict-key policy (R23): a second parser would be free to accept a key this one
+// rejects, which is exactly the drift #1728 closed inside a single file.
+//
+// Exported for the strict catalog-load gate (#1750), which validates the catalog's
+// hardware/<gpu>.yaml namespace by converting each file's YAML mapping to this payload shape
+// and decoding it HERE, rather than re-deriving the accepted key set. The catalog's hardware
+// namespace is not yet consumed by a run (calibration still comes from hardware_config.json),
+// so the gate is what keeps it loadable.
+func ParseHardwareCalibEntries(data []byte) (map[string]sim.HardwareCalib, error) {
 	// #1694: reject the pre-#1694 per-COLLECTIVE key. A legacy "InterNodeLatencyUs" is
 	// caught by the generic unknown-key check below too (#1728), but this guard runs
 	// FIRST so the operator gets the migration message instead: the value is NOT a
@@ -385,13 +399,19 @@ func parseHWConfig(HWConfigFilePath string) (map[string]sim.HardwareCalib, error
 
 // hardwareCalibProvenanceKeys are the documentation-only keys a hardware-config GPU
 // entry may carry alongside its numeric fields. The bundled hardware_config.json uses
-// both to record where each calibration came from (Discussion #589 for the MFU values,
+// the two _comment keys to record where each calibration came from (Discussion #589 for the MFU values,
 // the datasheet reasoning for the interconnect bandwidths) — provenance that belongs
 // next to the numbers it explains, since a reader checking a value looks at the entry,
 // not at a doc page. They are accepted and ignored: the value decode never reads them.
 // These exact spellings are what a config must use — like the calibration fields, a
 // case-only variant ("_Comment") is rejected with the canonical spelling named.
-var hardwareCalibProvenanceKeys = []string{"_comment", "_comment_interconnect"}
+//
+// "Provenance" (R2H2, blis-catalog#10) is the structured provenance tag every catalog
+// hardware/ and networks/ entry now carries — a `vendor_spec` enum on hardware that
+// mirrors the reusable Network fabric classes. Like the _comment keys it is accepted
+// and ignored here (the value decode never reads it); its enum is validated by the
+// catalog-side CI gate (R2H3, blis-catalog#8), not by this loader.
+var hardwareCalibProvenanceKeys = []string{"_comment", "_comment_interconnect", "Provenance"}
 
 // hardwareCalibKnownKeys maps the ASCII-lowercased form of every JSON key
 // parseHWConfig accepts on a GPU entry to its canonical spelling. It is derived from
@@ -553,16 +573,91 @@ func GetHWConfig(HWConfigFilePath string, GPU string) (sim.HardwareCalib, error)
 		sort.Strings(available)
 		return sim.HardwareCalib{}, fmt.Errorf("GPU %q not found in hardware config (available: %v)", GPU, available)
 	}
-	// #1530: the optional interconnect calibration is validated here, at the load
-	// boundary, so a malformed hardware config fails identically regardless of which
-	// latency backend will consume it — the roofline backend ignores these fields, and
-	// silently accepting a typo under roofline while rejecting it under trained-physics
-	// would be a confusing asymmetry (R23). Only the requested GPU is checked, so an
-	// unrelated malformed entry elsewhere in the file does not block an unrelated run.
-	if err := config.ValidateInterconnect(); err != nil {
+	// Only the requested GPU is validated, so an unrelated malformed entry elsewhere in the
+	// file does not block an unrelated run. ValidateHardwareCalibEntry holds the rules
+	// themselves so the strict catalog-load gate applies the same ones (see its comment).
+	if err := ValidateHardwareCalibEntry(GPU, config); err != nil {
 		return sim.HardwareCalib{}, fmt.Errorf("hardware config %q, GPU %q: %w", HWConfigFilePath, GPU, err)
 	}
 	return config, nil
+}
+
+// ValidateHardwareCalibEntry applies the load-boundary validation rules for ONE decoded GPU
+// calibration entry, and is the single home for them (R23). Two callers share it: GetHWConfig,
+// for the GPU a run selected, and the strict catalog-load gate (#1750), for every
+// <catalog>/hardware/<gpu>.yaml entry. Neither re-implements a rule, so a rule added HERE
+// reaches both rather than only the path whose author remembered it — the drift a reviewer of
+// #1750 could otherwise only prevent by noticing.
+//
+// It takes a decoded entry rather than a payload because strict KEY policy is already shared
+// one level up, in ParseHardwareCalibEntries; this is the VALUE half. gpu names the entry, so
+// a diagnostic can say WHICH one offends in a file of a dozen.
+//
+// The rule set is the #1530 interconnect pair — validated at the load boundary so a malformed
+// hardware config fails identically regardless of which latency backend will consume it (the
+// roofline backend ignores these fields, and silently accepting a typo under roofline while
+// rejecting it under trained-physics would be a confusing asymmetry, R23) — plus the #1829
+// dense-FP8-ratio ADVISORY, which warns rather than refuses (see DenseFP8RatioWarning).
+func ValidateHardwareCalibEntry(gpu string, calib sim.HardwareCalib) error {
+	if warning := DenseFP8RatioWarning(gpu, calib); warning != "" {
+		logrus.Warnf("%s", warning)
+	}
+	return calib.ValidateInterconnect()
+}
+
+// The plausible band for a hardware entry's TFlopsFP8 / TFlopsPeak ratio. The physical value
+// is 2.0 on every architecture BLIS models; the band is widened to ±~25% so datasheet rounding
+// and a future part quoting a slightly different boost clock for the two rates still pass,
+// while leaving a 1.6x margin to the nearest thing the check must catch (a 2x sparsity
+// multiplier applied to one of the two fields).
+const (
+	minDenseFP8Ratio = 1.8
+	maxDenseFP8Ratio = 2.5
+)
+
+// DenseFP8RatioWarning returns a diagnostic naming gpu when calib's peak-FLOPs pair is not a
+// self-consistent DENSE pair, or "" when the entry is in band. It is the single home for the
+// #1829 rule (R23): ValidateHardwareCalibEntry calls it, so it reaches every hardware table
+// BLIS reads — the bundled hardware_config.json, a <catalog>/hardware/<gpu>.yaml entry, and a
+// user's own file — and sim/latency/hw_fp8_ratio_test.go asserts the committed table against
+// this same function rather than a second copy of the band.
+//
+// TFlopsPeak and TFlopsFP8 must be read out of the SAME datasheet column. NVIDIA quotes each
+// tensor-core rate twice — a dense figure and a 2x-larger "with sparsity" figure — and mixing
+// the two silently halves or doubles a GPU's FP8 compute ceiling, which is exactly what the
+// bundled L40S entry did before #1829. What makes the mix detectable is the RATIO: FP8
+// throughput is exactly 2x BF16 on every part BLIS models, and sparsity is itself exactly a 2x
+// multiplier, so taking FP8 from the sparse column reads ~4x and the mirror-image slip reads
+// ~1x. Neither can land in band.
+//
+// It is ADVISORY — a warning on stderr, never a refusal. The band is a heuristic over today's
+// NVIDIA entries, not an architectural law: a legitimate future accelerator could sit outside
+// it, and refusing the run would trade a known-wrong number for an unknown false refusal (R1
+// still holds — nothing is silently corrected, the operator is told). stderr is diagnostics, so
+// this cannot touch INV-6's byte-identical stdout. No committed entry offends, so nothing
+// prints today; the committed table is fenced by the test, which is a hard failure.
+//
+// An entry with TFlopsFP8 == 0 declares no native FP8 path (an A100 has none) and is exempt:
+// the latency backends never divide by it, they fall back to TFlopsPeak.
+func DenseFP8RatioWarning(gpu string, calib sim.HardwareCalib) string {
+	if calib.TFlopsFP8 == 0 {
+		return ""
+	}
+	if !(calib.TFlopsPeak > 0) || math.IsInf(calib.TFlopsPeak, 0) {
+		return fmt.Sprintf("GPU %q declares TFlopsFP8 = %v but TFlopsPeak = %v: the FP8 rate "+
+			"cannot be checked against a missing or non-finite BF16 rate", gpu, calib.TFlopsFP8, calib.TFlopsPeak)
+	}
+	ratio := calib.TFlopsFP8 / calib.TFlopsPeak
+	if !(ratio >= minDenseFP8Ratio) || ratio > maxDenseFP8Ratio {
+		return fmt.Sprintf("GPU %q has a dense FP8:BF16 peak-FLOPs ratio of %.3gx "+
+			"(TFlopsFP8 = %v, TFlopsPeak = %v), outside the plausible band [%.2g, %.2g]. "+
+			"FP8 tensor-core throughput is 2x BF16 on every architecture BLIS models, so a "+
+			"ratio near 4x means TFlopsFP8 was taken from the datasheet's WITH-SPARSITY "+
+			"column while TFlopsPeak is dense (and a ratio near 1x means the mirror-image "+
+			"slip). Read both numbers out of the same column — see #1829",
+			gpu, ratio, calib.TFlopsFP8, calib.TFlopsPeak, minDenseFP8Ratio, maxDenseFP8Ratio)
+	}
+	return ""
 }
 
 // ParseHFConfig parses a HuggingFace config.json file into an HFConfig.

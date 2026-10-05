@@ -58,6 +58,7 @@ var (
 	totalKVBlocks             int64     // Total number of KV blocks available on GPU
 	maxNumSeqs                int64     // Maximum number of requests in the Running batch (vLLM: --max-num-seqs)
 	maxNumBatchedTokens       int64     // Maximum total number of tokens across requests in the Running batch (vLLM: --max-num-batched-tokens)
+	noEnablePrefixCaching     bool      // --no-enable-prefix-caching: disable cross-request GPU prefix reuse (vLLM parity, #1867)
 	blockSizeTokens           int64     // Number of tokens per KV block
 	betaCoeffs                []float64 // List of beta coeffs corresponding to step features
 	alphaCoeffs               []float64 // List of alpha coeffs corresponding to pre, postprocessing delays
@@ -1421,8 +1422,16 @@ func resolvePolicies(cmd *cobra.Command) ([]sim.ScorerConfig, *sim.PolicyBundle)
 	}
 	// Note: gpuMemoryUtilization and blockSizeTokens are validated in resolveLatencyConfig
 	// (before KV auto-calc). Not repeated here to avoid double-validation.
-	if kvCPUBlocks > 0 && (kvTransferBandwidth <= 0 || math.IsNaN(kvTransferBandwidth) || math.IsInf(kvTransferBandwidth, 0)) {
-		logrus.Fatalf("--kv-transfer-bandwidth must be a finite value > 0 when --kv-cpu-blocks > 0, got %f", kvTransferBandwidth)
+	// #1819: an UNSUPPLIED --kv-transfer-bandwidth means "derive from the catalog cpu_dram
+	// device" (resolveLegacyKVTransferCost, called once the model config is resolved).
+	// Derivation is selected by OMITTING the flag, not by its zero value: only an
+	// operator-SUPPLIED override is range-checked here, so a supplied 0 is refused rather
+	// than silently read as "derive". It is checked whether or not the legacy tier is enabled
+	// so a typo is never silently inert. Base latency is an int64 and has no invalid sentinel:
+	// Changed("kv-transfer-base-latency") distinguishes an explicit 0 override from omission.
+	if cmd.Flags().Changed("kv-transfer-bandwidth") &&
+		(kvTransferBandwidth <= 0 || math.IsNaN(kvTransferBandwidth) || math.IsInf(kvTransferBandwidth, 0)) {
+		logrus.Fatalf("--kv-transfer-bandwidth must be a finite value > 0 when supplied, got %f", kvTransferBandwidth)
 	}
 	if kvTransferBaseLatency < 0 {
 		logrus.Fatalf("--kv-transfer-base-latency must be >= 0, got %d", kvTransferBaseLatency)
@@ -1568,6 +1577,14 @@ func resolvePolicies(cmd *cobra.Command) ([]sim.ScorerConfig, *sim.PolicyBundle)
 	return parsedScorerConfigs, loadedBundle
 }
 
+// batchConfigFromCLI is the single run/replay wiring seam for vLLM batch settings.
+// Keeping both commands on this helper makes the prefix-caching toggle structurally
+// symmetric for INV-13 rather than relying on two call sites to stay in sync.
+func batchConfigFromCLI() sim.BatchConfig {
+	return sim.NewBatchConfig(maxNumSeqs, maxNumBatchedTokens, longPrefillTokenThreshold,
+		sim.WithPrefixCachingDisabled(noEnablePrefixCaching))
+}
+
 // registerSimConfigFlags registers all simulation-engine configuration flags
 // on the given command. Called by both runCmd and replayCmd to avoid
 // duplicating ~50 flag registrations.
@@ -1583,6 +1600,7 @@ func registerSimConfigFlags(cmd *cobra.Command) {
 	cmd.Flags().Int64Var(&totalKVBlocks, "total-kv-blocks", 1000000, "Total number of KV cache blocks")
 	cmd.Flags().Int64Var(&maxNumSeqs, "max-num-seqs", 256, "Maximum number of requests running together (vLLM parity)")
 	cmd.Flags().Int64Var(&maxNumBatchedTokens, "max-num-batched-tokens", 2048, "Maximum total number of new tokens across running requests (vLLM parity)")
+	cmd.Flags().BoolVar(&noEnablePrefixCaching, "no-enable-prefix-caching", false, "Disable cross-request GPU prefix-cache reuse (mirrors vLLM --no-enable-prefix-caching). Default is caching enabled; re-supply this flag on replay for run/replay parity (INV-13). CPU/offload reloads remain independent.")
 	// Deprecated aliases bound to the same vars for backward compatibility (issue #1570).
 	// pflag emits the deprecation warning to stderr, so stdout stays byte-identical (INV-6).
 	cmd.Flags().Int64Var(&maxNumSeqs, "max-num-running-reqs", 256, "Deprecated: use --max-num-seqs")
@@ -1642,8 +1660,14 @@ func registerSimConfigFlags(cmd *cobra.Command) {
 	// Tiered KV cache (PR12)
 	cmd.Flags().Int64Var(&kvCPUBlocks, "kv-cpu-blocks", 0, "CPU tier KV cache blocks (0 = disabled, single-tier mode). Typical: 1/3 of --total-kv-blocks")
 	cmd.Flags().Float64Var(&kvOffloadThreshold, "kv-offload-threshold", 0.9, "GPU utilization (0-1) above which blocks are offloaded to CPU. Default: offload when GPU >90% full")
-	cmd.Flags().Float64Var(&kvTransferBandwidth, "kv-transfer-bandwidth", 100.0, "CPU↔GPU transfer rate in blocks per tick. Higher = faster transfers")
-	cmd.Flags().Int64Var(&kvTransferBaseLatency, "kv-transfer-base-latency", 0, "Fixed per-transfer latency in ticks for CPU↔GPU KV transfers (0 = no fixed cost)")
+	// #1819 (R2G3b-sim): the REGISTERED default is 0 and means "nothing supplied ⇒ derive",
+	// not a rate of zero. The legacy transfer cost is computed from the catalog cpu_dram
+	// device fact (see cmd/kv_transfer_derive.go); a physics number must not live in a flag
+	// default, which physicsPricedFlagDefaults enforces statically. A supplied value
+	// overrides the derivation verbatim — including a supplied 0, which is therefore refused
+	// as out of range rather than read as a request to derive (resolvePolicies).
+	cmd.Flags().Float64Var(&kvTransferBandwidth, "kv-transfer-bandwidth", 0, "Override the CPU↔GPU transfer rate, in tokens per tick, used when --kv-cpu-blocks > 0. LEAVE IT UNSET to derive the rate from the catalog cpu_dram storage device (<catalog>/devices/storage.yaml) — derivation is selected by omitting the flag, not by passing 0, which is refused. A supplied value must be finite and > 0; higher = faster transfers")
+	cmd.Flags().Int64Var(&kvTransferBaseLatency, "kv-transfer-base-latency", 0, "Override the fixed per-block CPU↔GPU transfer latency in ticks used when --kv-cpu-blocks > 0. LEAVE IT UNSET to derive the latency from the catalog cpu_dram storage device; an explicitly supplied 0 is a valid override that disables the fixed cost")
 	cmd.Flags().Int64Var(&snapshotRefreshInterval, "snapshot-refresh-interval", 50000, "Prometheus snapshot refresh interval for all instance metrics in microseconds (0 = immediate/oracle mode, default 50ms = llm-d parity)")
 	cmd.Flags().Int64Var(&cacheSignalDelay, "cache-signal-delay", cluster.DefaultCacheSignalDelay, "Propagation delay for prefix cache signals in microseconds. Only affects precise-prefix-cache and no-hit-lru scorers; no effect on other routing policies. Default 50ms. Set to 0 for oracle mode (live cache state).")
 	cmd.Flags().Float64Var(&modelAutoscalerIntervalUs, "model-autoscaler-interval-us", 0, "Autoscaler tick interval in microseconds (0 = disabled). Overrides policy-config autoscaler.interval_us when non-zero.")
@@ -2706,6 +2730,13 @@ var runCmd = &cobra.Command{
 			}
 		}
 
+		// #1819/#1841: resolve both components of the LEGACY single-CPU-tier transfer
+		// from the catalog cpu_dram device now that the model config and TP are known.
+		// Shared with replayCmd through one helper (R23, INV-13); a no-op unless
+		// --kv-cpu-blocks > 0, and each operator override wins independently.
+		legacyTransfer := resolveLegacyKVTransferCost(cmd, lr.ModelConfig, tensorParallelism)
+		kvTransferBandwidth, kvTransferBaseLatency = legacyTransfer.bandwidth, legacyTransfer.baseLatency
+
 		// All ModelHardwareOptions (EP-group width #1548, cross-node serialization S #1694)
 		// are composed in one shared helper so run and replay cannot diverge (R23, INV-13).
 		mhwOpts := modelHardwareOptions(cmd, dpPlan)
@@ -2720,7 +2751,7 @@ var runCmd = &cobra.Command{
 				KVCacheConfig: sim.NewKVCacheConfig(totalKVBlocks, blockSizeTokens, kvCPUBlocks,
 					kvOffloadThreshold, kvTransferBandwidth, kvTransferBaseLatency,
 					sim.WithKVOffload(kvOffloadCfg)),
-				BatchConfig:   sim.NewBatchConfig(maxNumSeqs, maxNumBatchedTokens, longPrefillTokenThreshold),
+				BatchConfig:   batchConfigFromCLI(),
 				LatencyCoeffs: sim.NewLatencyCoeffs(lr.BetaCoeffs, lr.AlphaCoeffs),
 				// DP-as-placement (#1531): dpPlan.PerRankDP is the per-replica DP — 1 when
 				// the plan is active (each replica is one rank), else the CLI dataParallelism

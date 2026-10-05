@@ -11,8 +11,8 @@ type KVCacheConfig struct {
 	BlockSizeTokens       int64   // tokens per block (must be > 0)
 	KVCPUBlocks           int64   // CPU tier capacity (0 = single-tier, default)
 	KVOffloadThreshold    float64 // DEPRECATED: Ignored in vLLM v1 mirror model. Was: GPU utilization threshold for offload. (CLI default: 0.9, zero-value: 0)
-	KVTransferBandwidth   float64 // blocks/tick transfer rate (CLI default: 100.0, zero-value: 0)
-	KVTransferBaseLatency int64   // fixed cost per transfer (ticks, default 0)
+	KVTransferBandwidth   float64 // transfer rate in TOKENS per tick (TieredKVCache charges ceil(BlockSizeTokens/rate) per block); no CLI default since #1819 — cmd/ derives it from the catalog cpu_dram device (cmd/kv_transfer_derive.go)
+	KVTransferBaseLatency int64   // fixed cost per reloaded block (ticks); cmd/ derives omitted CLI values from catalog cpu_dram.base_latency
 	// Offload captures vLLM's multi-tier KV-offload config surface (H5, #1587). Its
 	// zero value is inert (Enabled=false) and unread by sim/kv in this PR (INV-6);
 	// it is set only via the WithKVOffload option. Kept as a nested sub-config value
@@ -87,13 +87,27 @@ type BatchConfig struct {
 	MaxNumSeqs                int64 // max requests in RunningBatch (vLLM: --max-num-seqs)
 	MaxNumBatchedTokens       int64 // max total new tokens across all requests in RunningBatch (vLLM: --max-num-batched-tokens)
 	LongPrefillTokenThreshold int64 // threshold for long prefill chunking
+	// PrefixCachingDisabled suppresses cross-request prefix reuse (vLLM:
+	// --no-enable-prefix-caching). False preserves the existing/default behavior.
+	PrefixCachingDisabled bool
+}
+
+// BatchOption is a functional option applied by NewBatchConfig so new batch settings can
+// remain zero-value compatible without adding positional constructor arguments (R4).
+type BatchOption func(*BatchConfig)
+
+// WithPrefixCachingDisabled mirrors a deployment launched with
+// --no-enable-prefix-caching. Absent means prefix caching stays enabled.
+func WithPrefixCachingDisabled(disabled bool) BatchOption {
+	return func(c *BatchConfig) { c.PrefixCachingDisabled = disabled }
 }
 
 // NewBatchConfig creates a BatchConfig with all fields explicitly set.
 // This is the canonical constructor — all construction sites must use it (R4).
 // Panics on invalid values: MaxNumSeqs and MaxNumBatchedTokens must be > 0,
 // LongPrefillTokenThreshold must be >= 0 (0 means disabled).
-func NewBatchConfig(maxNumSeqs, maxNumBatchedTokens, longPrefillTokenThreshold int64) BatchConfig {
+func NewBatchConfig(maxNumSeqs, maxNumBatchedTokens, longPrefillTokenThreshold int64,
+	opts ...BatchOption) BatchConfig {
 	if maxNumSeqs <= 0 {
 		panic(fmt.Sprintf("NewBatchConfig: MaxNumSeqs must be > 0, got %d", maxNumSeqs))
 	}
@@ -103,11 +117,15 @@ func NewBatchConfig(maxNumSeqs, maxNumBatchedTokens, longPrefillTokenThreshold i
 	if longPrefillTokenThreshold < 0 {
 		panic(fmt.Sprintf("NewBatchConfig: LongPrefillTokenThreshold must be >= 0, got %d", longPrefillTokenThreshold))
 	}
-	return BatchConfig{
+	cfg := BatchConfig{
 		MaxNumSeqs:                maxNumSeqs,
 		MaxNumBatchedTokens:       maxNumBatchedTokens,
 		LongPrefillTokenThreshold: longPrefillTokenThreshold,
 	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
 }
 
 // MaxSpeculativeTokens bounds SpeculativeConfig.K so verify width (K+1) and the

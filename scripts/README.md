@@ -172,6 +172,125 @@ Exit 0 when the thread was read (with or without refinements), 2 on a usage erro
 read failed** — in which case the digest's first line is `REFINEMENT-READ-FAILED` rather than empty,
 because empty output reads exactly like "this issue has no refinements".
 
+## deliver-trusted-comments.sh — the comment text an AI flow is allowed to read
+
+Prints the discussion on an issue or PR with every comment from an author who holds **no** write
+access on this repository removed, and says how many it withheld. `--json` emits the same trusted set
+as structured data for the qa-review Python consumers.
+
+```bash
+scripts/deliver-trusted-comments.sh --pr 1807         # conversation + reviews + inline comments
+scripts/deliver-trusted-comments.sh --issue 1806      # conversation comments
+scripts/deliver-trusted-comments.sh --json --pr 1807  # same trusted set, as JSON
+scripts/deliver-trusted-comments.sh --render p.json   # render a prepared payload, no network
+```
+
+**Why (#1806).** *Who* may trigger the AI flows was already gated to admin/maintain/write; *what*
+they then read was not — and this repository is public, so any GitHub user can comment on any issue
+or PR. An agent cannot reliably separate "context" from "instruction", so that text is a
+prompt-injection surface into flows on a self-hosted runner with credentials (and, in the correction
+phase, `contents: write`). This script is the structural half that stops a stranger's text reaching
+the agent; the prompts' "treat comments as data" is the behavioural half for the text that IS shown.
+
+**Wired STRUCTURALLY into the flows we control:** in `deliver-verify.yml` and `deliver-correct.yml`
+a workflow step runs this from the trusted default-branch checkout before the agent and writes the
+digest to `$RUNNER_TEMP/trusted-comments.md`; the agent reads that file and never fetches comments
+itself. The qa-review `answerer.py`/`adjudicator.py` read it (`--json`) instead of
+`gh … --json comments`. `claude.yml` is **out of scope** (#1806): it runs `claude-code-action` in tag
+mode, which assembles comment context itself, leaving no seam for the filter — a documented
+limitation. See the comment-text section in
+[docs/contributing/standards/agent-trust.md](../docs/contributing/standards/agent-trust.md).
+
+It covers **all three** sources the flows read — conversation comments, PR reviews, and PR inline
+(line-level) review comments — because a filter on one endpoint leaves the others open. Unlike
+`deliver-issue-refinements.sh` it **keeps** the automation's own comments, labelled `[automation]`
+(the `DELIVER-VERDICT` / `QA-VERDICT` markers the correction phase works from); human write-access
+entries are labelled `[write access]`. It never refuses — it continues on the trusted subset and
+reports the count withheld; excluded authors are named on **stderr** (and the workflow log) but not
+in the digest, because a login is attacker-chosen text and the agent only needs the count.
+
+Exit 0 when the discussion was read, 2 on a usage error, and **3 when the read failed** — first line
+`COMMENT-READ-FAILED` rather than empty, because empty output reads like "nobody has commented" and an
+agent that concludes that returns a clean verdict on findings it never saw. The selection law is the
+sibling `deliver-trusted-comments.jq`, tested by `scripts/deliver_trusted_comments_test.go`; the
+wiring into the flows by `scripts/deliver_trusted_comments_wiring_test.go`.
+
+## lib-gh-write-access.sh — the write-access trust boundary (sourced, not run)
+
+The repository's one implementation of "does this comment author hold write access?", plus the
+bounded `gh` wrapper (SIGTERM then SIGKILL) every such lookup runs under. Sourced by
+`deliver-issue-refinements.sh` and `deliver-trusted-comments.sh`, which need the same answer for two
+questions — *whose design opinion overrides an issue body* and *whose text may an agent read at all*.
+One copy, so the 404-vs-403 split cannot drift: a 404 is GitHub answering "not a collaborator", while
+a 401/403/429/5xx or a deadline expiry means the caller **could not ask** and must fail closed. A
+caller defines `degrade`, `SELF`, `REPO` and `TMP` before sourcing it.
+
+## deliver-author-gate.sh — may an AI flow run on this author's content?
+
+The single decision behind the container-level author gate (#1813): given one login, decide whether
+an AI flow may run on content that login authored. Every AI flow (the delivery loop's
+implement/verify/correct, interactive `@claude`, `/blis-pr-review`) calls it so the trust rule has
+one definition rather than four, and it is invoked from a **checkout pinned to the default branch at
+the workspace root**, placed before any event/delivery checkout — never a PR/delivery-ref copy, which
+the author could replace.
+
+```bash
+scripts/deliver-author-gate.sh octocat                 # probe the login via gh
+scripts/deliver-author-gate.sh --permission write alice # decide from a given permission, no network
+```
+
+The law matches `deliver-issue-refinements.sh`: allowed iff the author holds `admin`/`write`/`maintain`.
+Two single-author differences: `github-actions[bot]`/`claude[bot]` are trusted **without** a probe
+(the delivery loop's own PRs/issues are bot-authored, and the permission endpoint 404s for a bot
+login), and the exit codes distinguish outcomes the callers must not conflate — **0** allowed, **1**
+a definitive denial (clean 404 / `read` / `none`), **3** a probe failure (5xx/403/network/deadline)
+that fails closed **and loud**, `2` usage. The bounded-`gh` watchdog is the same one the sibling
+uses, so a stalled probe cannot hang a job. Tested by `scripts/deliver_author_gate_test.go`
+(decision, via a `gh` stub + the `--permission` seam) and `scripts/deliver_author_gate_wiring_test.go`
+(each workflow runs it from the trusted checkout and gates the agent on it).
+
+## catalog-load-gate.sh — the strict catalog-load CI gate (R1/C6)
+
+Loads **every** entry in the authoritative [`blis-catalog`](https://github.com/inference-sim/blis-catalog)
+through the same loader code path `blis run` uses, and fails on any rejection. C6 says there is *no
+validate command* — the simulator validates whatever it reads and fails naming the file and the
+problem — so the gate is this script driving `cmd.TestCatalogStrictLoad_RealCatalog`, not a
+subcommand and not a bespoke validator that could accept what a run rejects (#1750).
+
+```bash
+scripts/catalog-load-gate.sh                       # clone the pinned revision and load it
+BLIS_CATALOG=~/blis-catalog scripts/catalog-load-gate.sh   # load a checkout you already have
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BLIS_CATALOG` | *(unset)* | An existing catalog checkout to load. When set, nothing is cloned and the revision is whatever that checkout holds — for a local run against a work-in-progress catalog. |
+| `CATALOG_REPO` | the blis-catalog GitHub URL | Clone source. The tests point it at a throwaway local repository, so they stay offline. |
+| `CATALOG_REVISION` | a pinned 40-hex SHA | Revision to check out. |
+| `CATALOG_CHECKOUT` | a fresh `mktemp -d` | Where to clone. |
+| `GATE_TIMEOUT` | `5m` | `go test -timeout`. |
+
+The revision is **pinned, not floating**: a green run must mean "this commit loads *that* catalog".
+Tracking the catalog's default branch would let an unrelated catalog commit redden an unrelated PR and
+would make a past green run unreproducible — so adopting catalog changes is a `CATALOG_REVISION` bump
+in its own PR, which is then the review of the catalog change. `scripts/catalog_load_gate_test.go`
+fails if the default stops being a 40-hex SHA.
+
+Two failure modes are why this is a tested script rather than an inline workflow step: the load test
+**skips** when `BLIS_CATALOG` never reaches it (so a local `go test ./...` needs no catalog checkout)
+and `go test` reports a skip as a **pass** — so the script fails on a `--- SKIP:` line for the
+top-level test, and also requires its `--- PASS:` line, which catches a `-run` pattern that matched
+no test at all. Both patterns are anchored to the test name: an unanchored `--- SKIP` would match a
+skipped *subtest* (go test indents those) and fail a load that ran fine.
+
+**Wiring is a pending human step.** The `catalog-load` job that calls this script is quoted verbatim
+in the script header but is **not yet in `.github/workflows/ci.yml`** — the delivery loop's
+`GITHUB_TOKEN` has no `workflows` permission ([automated-delivery.md](../docs/contributing/automated-delivery.md)),
+so a human must paste it. Until then the authoritative-catalog load is an on-demand command, and
+only the committed fixture catalog is loaded on every PR (by `go test ./cmd/...`). Adding the job —
+and, if the check should block merges, marking it required in branch protection — is a merge
+precondition for #1750, not something this script can enforce from inside the repository.
+
 ## archon-plan-resolve.sh — find and extract a declared archon plan
 
 Finds the first `archon-plan: <path>` line in the declaration text and extracts that file

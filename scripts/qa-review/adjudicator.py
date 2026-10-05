@@ -9,7 +9,8 @@ author's defence and the current code.
 Source-comment selection is structural, not a substring search: a comment
 qualifies only if it IS a rendered report — an unquoted, unfenced
 "## qa-review — PR #" heading AND an "### Items to fix" section — and, when
---report-author/QA_REPORT_AUTHOR is set, only if that login posted it. Keying
+--report-author/QA_REPORT_AUTHOR is set, only if that login posted it (either
+spelling of a GitHub App actor matches — see same_login, #1834). Keying
 on the bare banner substring let a later comment that merely QUOTED it (a
 self-review discussing the findings, or one pasting an example report inside
 ``` fences) hijack the selection; with no Items-to-fix section of its own that
@@ -40,7 +41,10 @@ Env:
   OPENAI_API_KEY        proxy key; falls back to LITELLM_KEY
   QA_ADJUDICATOR_MODEL  default azure/gpt-5.6-sol
   QA_REPORT_AUTHOR      restrict the prior-report search to this comment
-                        author login (empty = any author)
+                        author login (empty = any author). Either spelling of a
+                        GitHub App actor is accepted -- "github-actions" and
+                        "github-actions[bot]" name the same poster (#1834).
+  QA_HTTP_*             transport timeout/retry knobs — see _http.py
 """
 
 import argparse
@@ -49,7 +53,12 @@ import os
 import re
 import subprocess
 import sys
-import urllib.request
+
+# The one canonical LLM transport, shared with answerer.py and questioner.py:
+# a bounded retry with backoff around each completion so a transient gateway
+# error no longer crashes a ~30-minute tool loop (#1833). Imported as a module
+# attribute so the existing tests can still monkeypatch post_chat_completion.
+from _http import post_chat_completion  # noqa: F401 — re-exported call target
 
 DEFAULT_MODEL = "azure/gpt-5.6-sol"
 MAX_TOOL_TURNS = 24
@@ -183,31 +192,71 @@ def tool_go(worktree, subcommand):
 # the same tools); each vendored qa-review script stays self-contained rather than sharing a
 # module, so the two are kept in sync by hand — if you edit one, edit both.
 #
-# gh_issue uses `--json ... -q`, NOT the default `--comments` view: the pretty view fetches
-# Projects-classic data (repository.issue.projectCards), which this repo's GitHub has
-# DEPRECATED, so `gh issue view --comments` exits non-zero with only a deprecation notice and
-# never returns the acceptance criteria. A non-zero gh exit is surfaced as an explicit failure
-# marker so the model treats it as missing evidence, never mistakes an error string for data.
-_GH_ISSUE_JQ = (
-    r'"#\(.number) \(.title)\n\n\(.body)\n\n--- comments ---\n"'
-    r' + ([.comments[] | "@\(.author.login): \(.body)"] | join("\n\n"))'
+# gh_issue reads the issue HEAD (number/title/body) via `--json ... -q`, NOT the default
+# `--comments` view: the pretty view fetches Projects-classic data
+# (repository.issue.projectCards), which this repo's GitHub has DEPRECATED, so
+# `gh issue view --comments` exits non-zero with only a deprecation notice and never returns
+# the acceptance criteria. A non-zero gh exit is surfaced as an explicit failure marker so
+# the model treats it as missing evidence, never mistakes an error string for data.
+#
+# The issue COMMENTS are read through scripts/deliver-trusted-comments.sh (#1806), NOT
+# inline: this repository is public, so a stranger's comment on the closing issue is a
+# prompt-injection surface into this LLM. The filter returns only comments whose author
+# holds write access (plus this repo's automation); a read failure surfaces as an UNREAD
+# marker rather than an empty thread, so a failed read is never mistaken for "no comments".
+_GH_ISSUE_HEAD_JQ = r'"#\(.number) \(.title)\n\n\(.body)"'
+
+# scripts/deliver-trusted-comments.sh, resolved relative to THIS file (scripts/qa-review/)
+# so it is found regardless of the caller's working directory.
+_TRUSTED_COMMENTS_SH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+    "deliver-trusted-comments.sh",
 )
 
 
+def _trusted_comment_lines(repo, mode, number):
+    """Return the write-access-filtered comments as `@login: body` blocks (#1806).
+
+    `mode` is "--issue" or "--pr". On ANY read failure the filter exits non-zero (its first
+    line is COMMENT-READ-FAILED); this returns that marker so the caller renders the channel
+    as UNREAD rather than as an empty thread — a stranger's comment must never reach the
+    model, and a failed read must never look like "no comments"."""
+    proc = subprocess.run(
+        ["bash", _TRUSTED_COMMENTS_SH, "--json", mode, str(number)],
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, GH_REPO=repo),
+    )
+    if proc.returncode != 0:
+        return "COMMENT-READ-FAILED: the comment channel could not be read (%s)" % (
+            proc.stderr.strip()[:500] or "no detail"
+        )
+    try:
+        comments = json.loads(proc.stdout).get("comments", [])
+    except json.JSONDecodeError:
+        return "COMMENT-READ-FAILED: the comment filter did not return JSON"
+    return "\n\n".join(
+        "@%s: %s" % ((c.get("author") or {}).get("login", ""), c.get("body", ""))
+        for c in comments
+    )
+
+
 def tool_gh_issue(worktree, number):
-    """Read-only: fetch a GitHub issue's acceptance criteria + comments."""
+    """Read-only: a GitHub issue's acceptance criteria + WRITE-ACCESS-FILTERED comments
+    (#1792, #1806)."""
     repo = os.environ.get("QA_REPO", "inference-sim/inference-sim")
     proc = subprocess.run(
         [
             "gh", "issue", "view", str(number), "--repo", repo,
-            "--json", "number,title,body,comments", "-q", _GH_ISSUE_JQ,
+            "--json", "number,title,body", "-q", _GH_ISSUE_HEAD_JQ,
         ],
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
         return "gh_issue failed (exit %d): %s" % (proc.returncode, proc.stderr.strip()[:2000])
-    return proc.stdout[:12000]
+    comments = _trusted_comment_lines(repo, "--issue", number)
+    return (proc.stdout + "\n\n--- comments ---\n" + comments)[:12000]
 
 
 def tool_pr_diff(worktree, number):
@@ -324,19 +373,6 @@ def tools_for(no_exec):
         schema = [t for t in TOOLS_SCHEMA if t["function"]["name"] != "go"]
         return impl, schema
     return dict(TOOLS_IMPL), list(TOOLS_SCHEMA)
-
-
-def post_chat_completion(base_url, api_key, model, messages, tools):
-    url = base_url.rstrip("/") + "/chat/completions"
-    payload = {"model": model, "messages": messages}
-    if tools:
-        payload["tools"] = tools
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", "Bearer " + api_key)
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read().decode("utf-8"))
 
 
 def run_tool(impl, worktree, name, arguments):
@@ -649,6 +685,71 @@ def is_report_comment(body):
     return has_heading and items_has_content
 
 
+# GitHub reserves the "[bot]" suffix for GitHub App actors, so "github-actions" and
+# "github-actions[bot]" are ONE actor spelled by two APIs: the GraphQL projection behind
+# `gh pr view --json comments` reports the short form, REST reports the canonical suffixed
+# one. That difference broke the re-verify (#1834): --report-author was written for the
+# short form, then #1806 rewired fetch_comments onto scripts/deliver-trusted-comments.sh,
+# which reads REST. The comparison was exact, so the adjudicator could no longer find its
+# OWN round-0 report — exit 3 on every re-verify, and every multi-round delivery stopped at
+# needs-human. Comparing the suffix-stripped spellings makes the restriction independent of
+# which API supplied the comment, so a source switch in either direction cannot silently
+# re-break it.
+_BOT_LOGIN_SUFFIX = "[bot]"
+
+# The label deliver-trusted-comments.sh puts on a comment whose author is one of THIS
+# repository's allowlisted automation identities. That allowlist is keyed on the canonical
+# `[bot]`-suffixed login precisely because GitHub reserves the suffix for App actors and the
+# bare spelling is one a human could register, so the label — unlike the login string on its
+# own — is positive evidence that the poster really is the App. It gates the suffix
+# equivalence below.
+_AUTOMATION_LABEL = "automation"
+
+
+def _fold_login(login):
+    """A GitHub login reduced to its identity for comparison only.
+
+    Case-insensitive because GitHub account identity is: `GitHub-Actions[bot]` and
+    `github-actions[bot]` are one account, and no two accounts can differ by case alone, so
+    folding cannot conflate distinct actors. Surrounding whitespace is stripped for the same
+    reason in reverse — a login can never contain any, so it is always an artefact of the
+    environment or the command line that carried the value here, never part of the name."""
+    return (login or "").strip().casefold()
+
+
+def same_login(a, b, app_actor=False):
+    """True iff two comment-author logins name the same actor.
+
+    Compared after _fold_login on both sides. An empty login on either side matches nothing:
+    absence is not an identity, so a restriction that folds away to nothing (`--report-author
+    '[bot]'`, or a whitespace-only value) fails closed rather than matching every App.
+
+    `app_actor` says the CALLER has independent evidence that `a` was posted by a GitHub App
+    — for select_report_comment, the trusted-comments filter's `automation` label. Only then
+    is the reserved "[bot]" suffix ignored, which is what makes the two API spellings of one
+    App actor compare equal (#1834). Without that evidence the comparison stays exact,
+    because the suffix is the ONLY thing distinguishing the App `github-actions[bot]` from a
+    bare `github-actions` a human could hold: stripping it unconditionally would let that
+    human satisfy a restriction written for the App.
+
+    For comparison only — never use the folded form to display or re-post a login."""
+    a, b = _fold_login(a), _fold_login(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if not app_actor:
+        return False
+
+    def unsuffixed(login):
+        if login.endswith(_BOT_LOGIN_SUFFIX):
+            return login[: -len(_BOT_LOGIN_SUFFIX)]
+        return login
+
+    a, b = unsuffixed(a), unsuffixed(b)
+    return bool(a) and a == b
+
+
 def select_report_comment(comments, report_author=""):
     """Index of the most recent genuine qa-review report comment, or -1.
 
@@ -657,12 +758,29 @@ def select_report_comment(comments, report_author=""):
     strict on purpose: this runs against a PUBLIC repository, so without it any
     commenter could post a report-shaped comment with an empty Items-to-fix
     section and clear every outstanding finding. It is empty by default so the
-    tool stays usable by hand, where the report's poster is whoever ran it."""
+    tool stays usable by hand, where the report's poster is whoever ran it.
+
+    Since #1806 it is defence in depth rather than the only barrier: every
+    comment reaching here already cleared deliver-trusted-comments.sh, which
+    admits only this repository's allowlisted automation logins and humans with
+    write access.
+
+    The login is compared with same_login, so either spelling of an App actor
+    matches (#1834) — but the suffix equivalence is granted ONLY to a comment that
+    filter labelled `automation`, i.e. one whose author is on its canonical
+    `[bot]`-keyed allowlist. A comment admitted for its author's WRITE ACCESS is
+    compared exactly, so a human holding the bare login `github-actions` does not
+    satisfy a restriction written `github-actions[bot]`. Fails closed on a missing
+    or unrecognised label: no label, no equivalence."""
     chosen = -1
     for i, c in enumerate(comments):
         if not is_report_comment(c.get("body") or ""):
             continue
-        if report_author and (c.get("author") or {}).get("login", "") != report_author:
+        if report_author and not same_login(
+            (c.get("author") or {}).get("login", ""),
+            report_author,
+            app_actor=c.get("label") == _AUTOMATION_LABEL,
+        ):
             continue
         chosen = i
     return chosen
@@ -675,14 +793,25 @@ def fetch_comments(repo, pr, report_author=""):
     blocking findings; every comment after it is treated as the author's
     defence. `items` is None — distinct from an empty list, which is a real
     report with no blocking findings — when no report comment was found at all,
-    so a caller can refuse rather than adjudicate nothing."""
+    so a caller can refuse rather than adjudicate nothing.
+
+    Comments are read through scripts/deliver-trusted-comments.sh (#1806), so a stranger's
+    comment on this PUBLIC PR never enters the adjudication prompt. The filter also returns
+    PR reviews and inline review comments; only CONVERSATION comments carry the qa-review
+    report and the author's later defence, so the others are ignored here — preserving this
+    selection's pre-#1806 behaviour. A read failure exits non-zero (check=True), which the
+    caller already treats as 'no adjudicable evidence' rather than a clean pass."""
     proc = subprocess.run(
-        ["gh", "pr", "view", str(pr), "--repo", repo, "--json", "comments"],
+        ["bash", _TRUSTED_COMMENTS_SH, "--json", "--pr", str(pr)],
         capture_output=True,
         text=True,
+        env=dict(os.environ, GH_REPO=repo),
         check=True,
     )
-    comments = json.loads(proc.stdout).get("comments", [])
+    comments = [
+        c for c in json.loads(proc.stdout).get("comments", [])
+        if c.get("source") == "conversation"
+    ]
     last_qa = select_report_comment(comments, report_author)
     if last_qa < 0:
         return None, ""
@@ -706,7 +835,7 @@ def main(argv=None):
         "--report-author",
         default=os.environ.get("QA_REPORT_AUTHOR", ""),
         help="only adjudicate a prior report posted by this comment author login "
-        "(empty = any author; see select_report_comment)",
+        "(empty = any author; the App '[bot]' suffix is optional; see select_report_comment)",
     )
     parser.add_argument("--out", default="", help="write the report here (else stdout)")
     parser.add_argument("--post-to-pr", action="store_true", help="post as a PR comment")

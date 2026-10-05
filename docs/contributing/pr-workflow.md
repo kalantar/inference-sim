@@ -48,6 +48,15 @@ flowchart TD
 > review commands, stopping at `ready-for-merge` for a human to merge or at `needs-human` with
 > a reason. The implement phase follows this document, so the rules below are still the source
 > of truth. See [Automated Delivery (L1)](automated-delivery.md).
+>
+> Both the *triggerer* and the *issue author* must hold `admin`/`write`/`maintain` (#1813): the
+> agent builds the issue body on a runner with credentials, so an outside-authored issue is
+> refused even when a maintainer runs the command — vet and re-author it first. The same
+> author gate applies to `@claude` and `/blis-pr-review` (they refuse an outside-authored PR/issue).
+> Beyond *who authored* the PR/issue, the review/correction agents and the cross-vendor qa-review
+> read comment text only through the write-access filter (`scripts/deliver-trusted-comments.sh`), so
+> a stranger's comment on a maintainer's PR cannot steer them (#1806); see
+> [agent-trust.md](standards/agent-trust.md#untrusted-input-comment-text-1806).
 
 ### Step 1: Create an Isolated Workspace
 
@@ -331,7 +340,7 @@ Check for:
 (7) Any division where the denominator derives from runtime state without a zero guard?
 (8) Any new interface with methods only meaningful for one implementation?
 (9) Any method >50 lines spanning multiple concerns (scheduling + latency + metrics)?
-(10) Any changes to `docs/contributing/standards/` files — are CLAUDE.md working copies updated to match?
+(10) Any changes to `docs/contributing/standards/` files — is the canonical doc the single source, with `CLAUDE.md` holding only a pointer to it (not a synced copy)?
 
 **Catches:** Logic errors, nil pointer risks, silent failures (discarded return values), panic paths reachable from user input, CLAUDE.md convention violations, dead code, silent `continue` data loss, non-deterministic map iteration, construction site drift, library code calling `os.Exit`, exported mutable maps, YAML zero-value ambiguity, division by zero in runtime computation, leaky interfaces, monolith methods, documentation drift.
 
@@ -436,7 +445,7 @@ Stop, think critically, and answer each question below from your own reasoning. 
 2. **Design bugs:** Does the design actually achieve what the contracts promise? Would a user get the expected behavior? Are there scale mismatches, unit confusions, or semantic errors?
 3. **Determinism (R2, INV-6):** Is all output deterministic? Any map iteration used for ordered output? Any floating-point accumulation order dependencies?
 4. **Consistency:** Are naming patterns consistent across all changed files? Do comments match code? Do doc strings match implementations? Are there stale references?
-5. **Documentation:** Would a new user find everything they need? Would a contributor know how to extend this? Are CLI flags documented everywhere (CLAUDE.md, README, `--help`)?
+5. **Documentation:** Would a new user find everything they need? Would a contributor know how to extend this? Are CLI flags documented where they belong (`--help`, README, and the relevant `docs/` guide)? Do NOT add per-flag detail to `CLAUDE.md` — it holds operating rules and pointers, not a flag catalogue.
 6. **Defensive edge cases:** What happens with zero input? Empty collections? Maximum values? What if the user passes unusual but valid flag combinations?
 7. **Test epistemology (R7, R12):** For every test that compares against a golden value, ask: "How do I know this expected value is correct?" If the answer is "because the code produced it," that test catches regressions but not pre-existing bugs. Verify a corresponding invariant test validates the result from first principles. (See issue #183: a golden test perpetuated a silently-dropped request for months.)
 8. **Construction site uniqueness (R4):** Does this PR add fields to existing structs? If so, are ALL construction sites updated? Grep for `StructName{` across the codebase. Are there canonical constructors, or are structs built inline in multiple places?
@@ -535,7 +544,7 @@ The workflow is the same regardless of source (RFC sub-issue, design doc, GitHub
 4. **Use worktrees for complex PRs** — avoid disrupting main workspace
 5. **Review after execution** — use automated code review (Step 4.5) after all tasks complete
 6. **Reference contracts in commits** — makes review easier and more traceable
-7. **Update CLAUDE.md immediately** — don't defer documentation
+7. **Document where it belongs — not in CLAUDE.md** — per-PR rationale goes in the commit body; durable detail goes in the relevant `docs/` guide or `--help`. Touch `CLAUDE.md` only when the change alters an operating rule an agent needs *every* session, and keep it a pointer when a canonical doc exists (see the charter at the top of CLAUDE.md). CLAUDE.md is loaded into every session, so a per-PR note there is expensive and re-accretes the changelog bloat #1818 removed. **If a change genuinely does target `CLAUDE.md`, label its issue `docs:claude-md`** — a `ci.yml` size-ceiling job guards the file's size on every PR, and the delivery loop's verify phase withholds `ready-for-merge` from a `CLAUDE.md` edit whose issue lacks that label (it fails safe to `needs-human`).
 8. **Keep source documents updated** — close resolved issues; update tracking issue if needed
 9. **Don't trust automated passes alone** — the self-audit (Step 4.75) catches substance bugs that pattern-matching agents miss. In PR9, 3 real bugs were found by critical thinking after 4 automated passes found 0 issues.
 10. **Checkpoint long sessions** — for PRs with 8+ tasks or multi-round reviews, write a checkpoint summary to `.claude/checkpoint.md` after each major phase. If you hit context limits, read the checkpoint first.

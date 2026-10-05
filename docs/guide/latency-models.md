@@ -46,7 +46,7 @@ both forms. Given it, the two required inputs resolve as:
 1. **Model config** -- reads the catalog entry at `<catalog>/models/<model-short-name>/config.json`; a model with no entry is refused, naming that path (nothing is fetched)
 2. **Hardware config** -- uses the bundled `hardware_config.json`
 
-**Supported hardware:** The bundled `hardware_config.json` includes specs for **H100** (80 GB HBM3, 989.5 TFLOPS BF16, 3.35 TB/s), **H200** (141 GB HBM3e, 989.5 TFLOPS BF16, 4.8 TB/s — same Hopper compute die as H100, more/faster memory), **A100-SXM** (80 GB HBM2e, 312 TFLOPS BF16, 2.04 TB/s), **A100-80** (alias for A100-SXM), and **L40S** (48 GB GDDR6, 362 TFLOPS BF16, 0.864 TB/s). To use a different GPU, add an entry to `hardware_config.json` with the required fields (`TFlopsPeak`, `BwPeakTBs`, `mfuPrefill`, `mfuDecode`, `MemoryGiB`), plus `IntraNodeBwGBps`/`InterNodeBwGBps` if instances on that GPU may span nodes (see [Inter-Node Network Cost](#inter-node-network-cost-trained-physics-only)) and reference it via `--hardware <name>`. The file is parsed strictly (#1728): an unrecognized or non-canonically-cased key is a hard error naming the key and the GPU entry, so a typo cannot silently read as 0 — only `_comment` / `_comment_interconnect` are accepted and ignored.
+**Supported hardware:** The bundled `hardware_config.json` includes specs for **H100** (80 GB HBM3, 989.5 TFLOPS BF16, 3.35 TB/s), **H200** (141 GB HBM3e, 989.5 TFLOPS BF16, 4.8 TB/s — same Hopper compute die as H100, more/faster memory), **A100-SXM** (80 GB HBM2e, 312 TFLOPS BF16, 2.04 TB/s), **A100-80** (alias for A100-SXM), and **L40S** (48 GB GDDR6, 362 TFLOPS BF16, 0.864 TB/s). To use a different GPU, add an entry to `hardware_config.json` with the required fields (`TFlopsPeak`, `BwPeakTBs`, `mfuPrefill`, `mfuDecode`, `MemoryGiB`), plus `IntraNodeBwGBps`/`InterNodeBwGBps` if instances on that GPU may span nodes (see [Inter-Node Network Cost](#inter-node-network-cost-trained-physics-only)) and reference it via `--hardware <name>`. The file is parsed strictly (#1728): an unrecognized or non-canonically-cased key is a hard error naming the key and the GPU entry, so a typo cannot silently read as 0 — only `_comment` / `_comment_interconnect` / `Provenance` are accepted and ignored (`Provenance` is the structured provenance tag catalog `hardware/` entries carry, R2H2 / blis-catalog#10; its enum is validated by the catalog CI gate, not this loader).
 
 **Validated models:** Any dense or MoE transformer with a HuggingFace `config.json` works. The following have been validated end-to-end:
 
@@ -92,15 +92,36 @@ Any model with a HuggingFace `config.json` can use roofline mode:
 The `--tp` flag divides FLOPs and memory traffic across TP ranks:
 
 - Higher TP reduces per-GPU step time (more parallelism)
-- Higher TP reduces KV blocks per GPU (memory split across ranks)
+- Higher TP usually *increases* `total_kv_blocks` — it adds whole GPUs of memory to the budget while the model weights stay a fixed total shared across them
+
+`total_kv_blocks` is a **global** count, not a per-GPU one: every TP rank stores its own shard of every block, so adding ranks does not divide the pool between them. (Whether TP sharding shrinks the *per-GPU* cost of a block depends on the attention architecture — it does for MHA/GQA, where KV heads are sharded, but not for MLA, where the compressed latent is replicated on every rank.) See [KV Cache Management](kv-cache.md#how-the-auto-calculated-pool-is-sized) for the formula.
 
 When choosing between TP and replication (more instances): TP reduces per-request latency, replication increases throughput. For capacity planning, simulate both configurations.
 
 !!! note "Automatic KV block calculation"
-    For both latency backends (roofline, trained-physics), `--total-kv-blocks` is automatically derived from model architecture and GPU memory if not explicitly set. The auto-calculated value accounts for TP (KV heads are sharded across ranks; total GPU memory scales with GPU count). Override with `--total-kv-blocks <N>` for non-standard deployments. The auto-calculation uses reference constants (90% GPU utilization, standard activation/overhead budgets matching the llm-d-benchmark capacity planner) and requires SwiGLU-family activations.
+    For both latency backends (roofline, trained-physics), `--total-kv-blocks` is automatically derived from model architecture and GPU memory if not explicitly set. The auto-calculated value accounts for TP on both sides of its division: the memory budget scales with GPU count, and the cost of one global block is its per-GPU cost on every one of the TP GPUs (#1846). Override with `--total-kv-blocks <N>` for non-standard deployments. The auto-calculation uses reference constants (90% GPU utilization, standard activation/overhead budgets matching the llm-d-benchmark capacity planner) and requires SwiGLU-family activations. It is an analytical estimate rather than a reproduction of vLLM's own per-rank memory profiling, and stays slightly optimistic at high TP — pin `--total-kv-blocks` when the pool must match a specific deployment.
 
 !!! note "Automatic MaxModelLen derivation"
     When using roofline or trained-physics mode and `--max-model-len` is not explicitly set, BLIS auto-derives it from `max_position_embeddings` in the HuggingFace `config.json`. For models with `rope_scaling`, the scaling factor is applied based on vLLM's blacklist approach: types `linear`, `dynamic`, `yarn`, `default`, and `mrope` apply the factor; types `su`, `longrope`, and `llama3` are excluded (these encode the full context in `max_position_embeddings`). For `yarn`, `original_max_position_embeddings` is used as the base when present. `gemma3` models skip `rope_scaling` entirely (`max_position_embeddings` is pre-scaled). The derived value is then capped at the KV-feasible maximum (`total_kv_blocks * block_size`) to prevent context windows from exceeding GPU memory capacity. Override with `--max-model-len` <N>` when needed.
+
+### Prefix caching engine setting
+
+`blis run` and `blis replay` expose `--no-enable-prefix-caching` to mirror vLLM's
+engine-level negative flag. The default is unchanged: prefix caching is enabled. When the
+flag is present, a newly admitted request receives no cross-request GPU prefix credit, so its
+prefill is charged from the start of the prompt. A request already in progress still resumes
+from its own computed position.
+
+The switch deliberately does **not** disable CPU/offload-tier reloads. vLLM treats local
+prefix-cache lookup and external KV reload as independent mechanisms, and BLIS keeps the same
+boundary. The setting is also a deployment input rather than trace data: re-supply
+`--no-enable-prefix-caching` on replay to reproduce a run (INV-13), like
+`--kv-cache-dtype`.
+
+Scope note: this flag currently gates batch-formation reuse only. The cluster routing scorers
+`precise-prefix-cache` and `no-hit-lru` still query cache affinity; making those scorers
+ignore affinity when engine prefix caching is disabled is a separate cluster-level follow-up
+rather than being silently conflated with the simulator gate in #1867.
 
 ## How Trained-Physics Works
 
@@ -152,9 +173,23 @@ The trained-physics model is designed to generalize without per-model calibratio
 **Supported hardware:**
 
 - **H100** (80 GB HBM3, 989.5 TFLOPS BF16 / 1979 TFLOPS FP8, 3.35 TB/s)
-- **A100-SXM** (80 GB HBM2e, 312 TFLOPS BF16, 2.04 TB/s)
+- **H200** (141 GB HBM3e, 989.5 TFLOPS BF16 / 1979 TFLOPS FP8, 4.8 TB/s — same Hopper compute die as H100)
+- **A100-SXM** (80 GB HBM2e, 312 TFLOPS BF16, 2.04 TB/s — Ampere has no FP8 tensor cores)
 - **A100-80** (alias for A100-SXM)
-- **L40S** (48 GB GDDR6, 362 TFLOPS BF16 / 1466 TFLOPS FP8, 0.864 TB/s)
+- **L40S** (48 GB GDDR6, 362 TFLOPS BF16 / 733 TFLOPS FP8, 0.864 TB/s)
+
+!!! warning "Peak FLOPs are the **dense** figures — never the with-sparsity ones"
+    `TFlopsPeak` and `TFlopsFP8` are both dense tensor-core throughput, so their ratio is
+    ~2.0x on every entry (H100 1979/989.5, L40S 733/362.05). NVIDIA datasheets also quote a
+    2x-larger *with-sparsity* number, and taking `TFlopsFP8` from that column while
+    `TFlopsPeak` stays dense doubles the FP8 compute ceiling — which is exactly what the
+    bundled L40S entry did until #1829 (it shipped `1466.0`, implying an impossible 4.05x
+    ratio). When adding a GPU, read both numbers out of the same column. The ratio of every
+    bundled entry is a hard test failure (`sim/latency/hw_fp8_ratio_test.go`), and every
+    hardware table BLIS *reads* — a `<catalog>/hardware/<gpu>.yaml` entry or your own
+    `--hardware` file — is checked at the load boundary, which **warns on stderr naming the
+    GPU** rather than refusing the run (the band is a heuristic over today's NVIDIA parts, so
+    a legitimate accelerator outside it must still run).
 
 **Coefficients were trained on H100 traces** but the roofline basis functions automatically scale to each GPU's compute/bandwidth specifications via hardware config. This enables the model to generalize across hardware without GPU-specific calibration.
 
@@ -189,7 +224,7 @@ Trained-physics uses up to **14 coefficients** (11 beta: prefill compute/memory 
 
 For MoE deployments, trained-physics models data parallelism (`--dp`) and expert parallelism (`--enable-expert-parallel`) the way vLLM does (mirrors `vllm-project/vllm`):
 
-- **Routed-expert weight/compute** are scoped via the `ExpertPlacement` seam. **Compute** uses the flattened MoE group `moeGroup = TP·DP`. **Weights** use the *expert-shard* group (#1548), which equals `moeGroup` unless expert parallelism widens it: each GPU holds `numExperts/expertShardGroup` full-expert-equivalents. This replaces a batch-dependent heuristic, so MoE step time at `DP=1` intentionally differs from pre-DP/EP BLIS (a deliberate fidelity fix). Dense models at `DP=1` are byte-identical (INV-BC-DP1). For a *single* `ModelHardwareConfig` at `TP·DP`, both EP modes give per-GPU routed bytes `numExperts/(TP·DP)` and that matches vLLM: `FusedMoEParallelConfig.make` flattens TP across DP for MoE layers *unconditionally*. Under DP-as-placement the two modes separate, because a replica's own DP is 1 — see [Expert Parallelism](#expert-parallelism-ep-1548). The step-time and capacity models now agree on the same expert-shard group in both modes, closing the inconsistency [#1666](https://github.com/inference-sim/inference-sim/issues/1666) tracks (that issue also covers the EP-**off** `DP>1` baseline, which BLIS deliberately keeps conservative and #1548 does not change).
+- **Routed-expert weight/compute** are scoped via the `ExpertPlacement` seam. **Compute** uses the flattened MoE group `moeGroup = TP·DP`. **Weights** use the *expert-shard* group (#1548), which equals `moeGroup` unless expert parallelism widens it: each GPU holds `numExperts/expertShardGroup` full-expert-equivalents. That resident count is the **ceiling**, not the per-step charge: since [#1849](https://github.com/inference-sim/inference-sim/issues/1849) the weight term scales it by the expected fraction of experts some token in the step actually routes to, `activatedFraction(B) = 1 − ((N−k)/N)^B` for `B` tokens in the step (the coupon-collector occupancy expectation the roofline backend has used since #764/#790, now shared by both backends). So MoE decode step time rises with the running batch again: `B=1` streams only the `~k` experts one token routes to, and `B → ∞` recovers the full resident count. Because the fraction is in `[0,1]` it only scales the ceiling *down*, so the #1548 expert-shard scoping is untouched. MoE step time at `DP=1` therefore intentionally differs both from pre-DP/EP BLIS and from pre-#1849 BLIS (deliberate fidelity fixes). Dense models at `DP=1` are byte-identical (INV-BC-DP1). For a *single* `ModelHardwareConfig` at `TP·DP`, both EP modes give per-GPU routed bytes `numExperts/(TP·DP)` and that matches vLLM: `FusedMoEParallelConfig.make` flattens TP across DP for MoE layers *unconditionally*. Under DP-as-placement the two modes separate, because a replica's own DP is 1 — see [Expert Parallelism](#expert-parallelism-ep-1548). The step-time and capacity models now agree on the same expert-shard group in both modes, closing the inconsistency [#1666](https://github.com/inference-sim/inference-sim/issues/1666) tracks (that issue also covers the EP-**off** `DP>1` baseline, which BLIS deliberately keeps conservative and #1548 does not change).
 - **Sequence-split terms** (attention/dense-FFN compute, KV read/write) gain a `/dp` factor — each DP rank processes ~`1/dp` of the tokens. Weights stay `/tp` (replicated across DP groups).
 - **Shared experts** (DeepSeek/Qwen-style) are charged for every token when the model exposes a shared-expert FFN dim; a no-op otherwise (including Llama-4 Scout until its shared-expert dim — `config.intermediate_size`, not `intermediate_size_mlp` which is the dense-layer FFN — is mapped).
 - **MoE-FFN communication** partitions on the `DP`-or-`EP` boundary: with EP off at `DP=1, TP>1` an all-reduce over the TP group; at `DP>1`, or whenever expert parallelism is on, a dispatch/combine all-to-all (β_EP). Exactly one of the two is charged.
@@ -224,6 +259,25 @@ warns. It applies to EP-**on** only: with EP off the experts are tensor-sharded,
 genuinely holds a *fraction* of every expert and a sub-1 value is the correct charge. The
 dispatch collective is deliberately **not** clamped — it really does span every rank in the
 group, however few experts they hold.
+
+The #1849 activated fraction that scales the resident weight bytes is **global** — computed
+from the model's `N` and `k` over the whole step — and is applied to each rank's resident
+count. EP ownership does **not** make that a per-rank approximation: under uniform top-k every
+expert carries the same activation probability `1 − ((N−k)/N)^B` whichever rank holds it, so by
+linearity of expectation a rank with `R` resident experts activates exactly `R ·
+activatedFraction(B)` of them in expectation, for any balanced placement. The residual
+approximations are elsewhere, and each vanishes at saturation:
+
+- **`B` is the step's own token population.** For a single `ModelHardwareConfig` at `DP>1`
+  that is already the group-wide count the `/dp` divisors presuppose — the right `B`, since
+  all-to-all dispatch means a rank's experts see the whole group's tokens. Under
+  DP-as-placement the two separate: the replica runs `DP=1` over its own batch while the
+  expert-shard group is the wider *logical* EP width, so `B` understates the tokens that
+  really dispatch to that rank and the fraction is charged **low** below saturation.
+- **It prices the expectation, not a realized per-step count** — the relative spread is widest
+  when a rank holds few whole experts (EP on over a wide group).
+- **Uniform, independent, unskewed routing with no capacity limits**, the shared pessimism of
+  the coupon-collector term itself; refinement deferred to #789.
 
 Compute is EP-mode-invariant on purpose: with EP on, the `EP` GPUs jointly process the
 whole group's tokens, so per-GPU FLOPs land on the same value tensor-sharding gives. EP
