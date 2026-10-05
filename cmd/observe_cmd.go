@@ -80,6 +80,9 @@ var (
 	observeTotalSessions      int
 	observeShuffleCorpus      bool
 	observeDuration           time.Duration
+	// observeDispatchAdapters honors per-request LoRA adapter ids on the wire
+	// (experimental, #1464). Off => adapter ids are ignored exactly as before.
+	observeDispatchAdapters bool
 	// saturationReport is declared in root.go and shared across run, replay, observe
 )
 
@@ -172,6 +175,7 @@ func init() {
 	observeCmd.Flags().IntVar(&observeConcurrentSessions, "concurrent-sessions", 0, "Replay a fixed pool of N concurrent closed-loop sessions from --corpus-* against the server (0 = disabled). Mutually exclusive with spec-mode inputs (--workload/--workload-spec/--rate/--concurrency).")
 	observeCmd.Flags().IntVar(&observeTotalSessions, "total-sessions", 0, "Total sessions to replay under --concurrent-sessions; duplicates the corpus (with cache-busting) to fill. 0 = replay each corpus session once.")
 	observeCmd.Flags().DurationVar(&observeDuration, "duration", 0, "Bound a corpus run by TIME instead of session count (e.g. 20m): once this much of the measured window has elapsed, STOP SENDING \u2014 no new sessions and no further rounds of sessions already running \u2014 then wait for requests already on the wire to finish. Sessions cut off mid-conversation are recorded as far as they got, so the output trace contains partial sessions. Until the bound the session queue is open-ended (the corpus is cycled with cache-busting clones), so it never runs dry. Measured from the start of the dispatch loop, so it excludes --prewarm-duration and tokenizer calibration. Requires --concurrent-sessions > 0; mutually exclusive with --total-sessions.")
+	observeCmd.Flags().BoolVar(&observeDispatchAdapters, "dispatch-adapters", false, "EXPERIMENTAL (#1464): honor per-request LoRA adapter ids on the wire. Each request names its adapter in the body's \"model\" field instead of --model, and the adapter is recorded in the output trace's adapter column so `blis calibrate` can attribute per-adapter latency. Every adapter id the spec references is preflighted against the server's GET /v1/models at startup and an unserved id is refused. --model stays required as the base-model fallback for adapter-blind requests, prewarm, and tokenizer calibration. Off (default): adapter ids are ignored, as before. Requires --workload-spec; invalid in corpus-mode.")
 	observeCmd.Flags().BoolVar(&observeShuffleCorpus, "shuffle-corpus", false, "Randomize the corpus step/admission order (seeded from --seed; uses the SAME permutation as `blis replay --shuffle-corpus`, so observe and replay of one corpus+seed select the same subset — for calibration parity). Requires --concurrent-sessions > 0. With --total-sessions < corpus this yields a seeded-random subset; every session still runs otherwise.")
 	observeCmd.Flags().StringVar(&observeSessionIDHeader, "session-id-header", defaultSessionIDHeader, "Request header carrying the closed-loop session id for session-aware EPP routing (session-affinity / predictive pinning). Must match the deployment's session-id-producer. Empty disables emission (issue #1505).")
 
@@ -226,6 +230,25 @@ func validateObserveWorkloadFlags(preset, workloadSpec string, rateChanged bool,
 	}
 	if !rateChanged {
 		return fmt.Sprintf("--workload %q requires --rate (preset synthesis needs a request rate)", preset)
+	}
+	return ""
+}
+
+// validateDispatchAdaptersFlags rejects --dispatch-adapters in corpus-mode.
+//
+// Adapter dispatch is driven by the adapter ids a WORKLOAD SPEC declares, and the
+// startup preflight validates exactly those against the target server. A corpus is
+// read from a trace file, whose adapter column this path does not preflight, so
+// honoring it would dispatch unvalidated ids — refuse rather than half-support it
+// (R1: never a silently different guarantee between two input modes).
+//
+// Returns a non-empty error string if the combination is invalid, empty otherwise.
+// Extracted for unit testability (R14).
+func validateDispatchAdaptersFlags(dispatchAdapters, corpusMode bool) string {
+	if dispatchAdapters && corpusMode {
+		return "--dispatch-adapters is invalid with --concurrent-sessions (corpus-mode): adapter dispatch is " +
+			"driven by a workload spec's adapter ids, which are preflighted against the server at startup. " +
+			"Use --workload-spec to dispatch adapters."
 	}
 	return ""
 }
@@ -304,6 +327,11 @@ func runObserve(cmd *cobra.Command, _ []string) {
 	); msg != "" {
 		logrus.Fatalf("%s", msg)
 	}
+	// Adapter dispatch (#1464) is spec-mode only: the startup preflight validates the
+	// adapter ids a spec declares, and corpus-mode has no spec.
+	if msg := validateDispatchAdaptersFlags(observeDispatchAdapters, observeConcurrentSessions > 0); msg != "" {
+		logrus.Fatalf("%s", msg)
+	}
 	// BC-7: at least one workload input mode must be provided (corpus-mode counts).
 	if observeConcurrentSessions == 0 && observeWorkload == "" && observeWorkloadSpec == "" && !cmd.Flags().Changed("rate") && observeConcurrency <= 0 {
 		logrus.Fatalf("Either --workload, --workload-spec, --rate, --concurrency, or --concurrent-sessions is required")
@@ -370,6 +398,9 @@ func runObserve(cmd *cobra.Command, _ []string) {
 	// corpus-mode spec stays nil and wl is an empty GeneratedWorkload so the
 	// spec-guarded blocks below are no-ops.
 	var spec *workload.WorkloadSpec
+	// dispatchAdapterIDs are the adapter ids the spec references, preflighted against
+	// the server once the HTTP client exists (#1464). Empty unless --dispatch-adapters.
+	var dispatchAdapterIDs []string
 	var wl *workload.GeneratedWorkload
 	// lazySource is typed as the interface satisfied by *workload.lazyRequestSource:
 	// Next() feeds the orchestrator, Err() surfaces a terminal per-client sampler
@@ -467,15 +498,33 @@ func runObserve(cmd *cobra.Command, _ []string) {
 			spec.Seed = observeSeed
 		}
 
-		// LoRA adapter fields are not supported by `blis observe`: it dispatches to a
-		// real server that manages its own adapter loading, so there is no registry to
-		// validate against and no in-simulator adapter state (#1464). Warn loudly rather
-		// than silently thread dangling adapter ids onto every dispatched request.
-		if workload.SpecHasAdapterFields(spec) {
+		// LoRA adapter fields (#1464). Two dispositions, never a silent one:
+		//
+		//   --dispatch-adapters OFF (default): observe does not model the LoRA control
+		//   plane, so adapter ids are ignored. Warn loudly rather than thread dangling
+		//   ids onto every dispatched request.
+		//
+		//   --dispatch-adapters ON (experimental): the target server manages adapter
+		//   loading, so the server IS the registry. Preflight every referenced id
+		//   against GET /v1/models and refuse an unserved one before any measurement
+		//   begins — a wrong id would otherwise be answered from the base model and
+		//   read as a successful run.
+		specAdapters := workload.SpecAdapterIDs(spec)
+		switch {
+		case !observeDispatchAdapters && len(specAdapters) > 0:
 			logrus.Warnf("workload spec declares LoRA adapter fields, but `blis observe` does not " +
 				"model the LoRA control plane (the target server manages adapter loading); adapter " +
-				"ids are ignored here. Use `blis run`/`blis replay` with --lora-config for adapter-aware simulation.")
+				"ids are ignored here. Pass --dispatch-adapters to send them to the server, or use " +
+				"`blis run`/`blis replay` with --lora-config for adapter-aware simulation.")
+		case observeDispatchAdapters && len(specAdapters) == 0:
+			// Never a silent no-op (R1): the operator asked for adapter dispatch and
+			// the workload has no adapter to dispatch.
+			logrus.Warnf("--dispatch-adapters is set, but the workload spec declares no adapter ids; " +
+				"every request will name the base --model.")
 		}
+		// The preflight itself needs the HTTP client, which is constructed below;
+		// specAdapters carries the referenced ids there.
+		dispatchAdapterIDs = specAdapters
 
 		// Resolve horizon
 		horizon := int64(math.MaxInt64)
@@ -554,6 +603,25 @@ func runObserve(cmd *cobra.Command, _ []string) {
 		WithHTTPTimeout(time.Duration(observeTimeout)*time.Second),
 		WithSessionIDHeader(observeSessionIDHeader))
 	recorder := &Recorder{}
+
+	// --dispatch-adapters preflight (#1464): the target server manages adapter
+	// loading, so the server IS the registry this path lacked. Refuse an unserved
+	// adapter BEFORE any measurement begins — dispatching a wrong id would be
+	// answered from the base model and read as a successful run.
+	if observeDispatchAdapters && len(dispatchAdapterIDs) > 0 {
+		preflightCtx, preflightCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		served, err := client.ListModels(preflightCtx)
+		preflightCancel()
+		if err != nil {
+			logrus.Fatalf("--dispatch-adapters preflight failed: could not list the models served by %s: %v",
+				observeServerURL, err)
+		}
+		if err := verifyAdaptersServed(dispatchAdapterIDs, served); err != nil {
+			logrus.Fatalf("--dispatch-adapters preflight failed: %v", err)
+		}
+		logrus.Infof("--dispatch-adapters: preflighted %d adapter(s) against %s: %s",
+			len(dispatchAdapterIDs), observeServerURL, strings.Join(dispatchAdapterIDs, ", "))
+	}
 
 	// Calibrate tokens-per-word ratio for the server's tokenizer (BC-6).
 	// Used for both prefix string building and non-prefix prompt scaling.
@@ -1142,6 +1210,9 @@ func runObserveOrchestrator(
 		defer func() { <-semaphore }() // release concurrency slot
 
 		pending := requestToPending(req, idx, noStreaming, unconstrained, prefixes, prefixLengths, tokensPerWord)
+		// The one adapter-dispatch gate (#1464): with the flag off the adapter id is
+		// cleared here, so neither the request body nor the recorded trace can carry it.
+		gateAdapterDispatch(pending, observeDispatchAdapters)
 		record, sendErr := client.Send(ctx, pending)
 		if sendErr != nil {
 			logrus.Warnf("request %d: Send returned error: %v", idx, sendErr)
@@ -1490,6 +1561,9 @@ func requestToPending(req *sim.Request, reqIndex int, noStreaming, unconstrained
 		DeadlineUs:      req.Deadline,
 		SLOTargetUs:     req.SLOTargetUs,
 		SessionID:       req.SessionID,
+		// Copied unconditionally; gateAdapterDispatch at the call site decides
+		// whether it survives to the wire (#1464).
+		Adapter: req.Adapter,
 	}
 }
 

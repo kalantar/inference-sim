@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,6 +119,42 @@ type PendingRequest struct {
 	DeadlineUs      int64
 	SLOTargetUs     int64
 	SessionID       string // closed-loop session id, emitted as the session-id header (issue #1505)
+	// Adapter is the LoRA adapter id serving this request (#1464), copied from the
+	// generated sim.Request. When non-empty it REPLACES the base model in the request
+	// body: an OpenAI-compatible server addresses a loaded adapter by naming it in
+	// "model". Empty = base-model-only.
+	//
+	// gateAdapterDispatch clears this unless --dispatch-adapters is set, so it is the
+	// single point where adapter dispatch turns on; everything downstream (the request
+	// body, the recorded trace) reads it unconditionally.
+	Adapter string
+}
+
+// dispatchModelFor resolves the value of the request body's "model" field: the
+// adapter id when the request names one, else the run's base model.
+//
+// Deliberately NOT falling back to PendingRequest.Model. That field is populated
+// from the spec but has never reached the wire, so promoting it to a fallback would
+// silently change dispatch for existing adapter-blind runs whose spec sets `model:`.
+// Adapter-or-base leaves today's behavior bit-for-bit intact.
+func dispatchModelFor(adapter, baseModel string) string {
+	if adapter != "" {
+		return adapter
+	}
+	return baseModel
+}
+
+// gateAdapterDispatch applies the --dispatch-adapters gate to one request. With
+// dispatch disabled the adapter id is cleared, so neither the request body nor the
+// exported trace can carry it and the default path stays byte-identical.
+//
+// One gate, applied once per request at the single requestToPending call site —
+// which both spec-mode and corpus-mode dispatch flow through.
+func gateAdapterDispatch(p *PendingRequest, enabled bool) {
+	if p == nil || enabled {
+		return
+	}
+	p.Adapter = ""
 }
 
 // RequestRecord captures one request-response cycle.
@@ -153,7 +190,7 @@ func (c *RealClient) Send(ctx context.Context, req *PendingRequest) (*RequestRec
 
 	// Build request body
 	body := map[string]interface{}{
-		"model":  c.modelName,
+		"model":  dispatchModelFor(req.Adapter, c.modelName),
 		"stream": req.Streaming,
 	}
 
@@ -462,6 +499,85 @@ func (c *RealClient) handleStreamingResponse(resp *http.Response, record *Reques
 	return record, nil
 }
 
+// ListModels fetches the ids the target server serves from GET /v1/models — base
+// models and any loaded LoRA adapters alike, since an OpenAI-compatible server
+// addresses both by naming them in a request's "model" field.
+//
+// This supplies the registry #1464 noted observe was missing: the adapter set on a
+// real server is the server's business, so observe asks it rather than validating
+// against simulator state it does not have. A transport or non-200 failure returns
+// an error and is NEVER reported as an empty list — an empty registry would make
+// every adapter look unserved (R1).
+func (c *RealClient) ListModels(ctx context.Context) ([]string, error) {
+	url := c.baseURL + "/v1/models"
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build /v1/models request: %w", err)
+	}
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+	}
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode %s body: %w", url, err)
+	}
+	ids := make([]string, 0, len(payload.Data))
+	for _, m := range payload.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids, nil
+}
+
+// verifyAdaptersServed reports whether every referenced adapter id appears among
+// the ids the server serves. A missing adapter is a hard error naming the offending
+// id AND what the server does serve, because the realistic cause is a typo or an
+// adapter that was never loaded — and the failure mode without this check is the
+// server quietly answering from the base model, which looks like a successful run
+// with suspiciously uniform latency.
+//
+// Pure (both inputs are arguments), so the rule is table-testable without a server.
+func verifyAdaptersServed(referenced, served []string) error {
+	if len(referenced) == 0 {
+		return nil // base-model-only workload: nothing to preflight
+	}
+	have := make(map[string]struct{}, len(served))
+	for _, id := range served {
+		have[id] = struct{}{}
+	}
+	var missing []string
+	for _, id := range referenced {
+		if _, ok := have[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	available := append([]string(nil), served...)
+	sort.Strings(available)
+	servedDesc := strings.Join(available, ", ")
+	if servedDesc == "" {
+		servedDesc = "<none>"
+	}
+	return fmt.Errorf("the target server does not serve adapter(s) %s; it serves: %s",
+		strings.Join(missing, ", "), servedDesc)
+}
+
 // ScrapeKVMetrics fetches the server's Prometheus /metrics endpoint and parses it
 // into a family→summed-value map (#1583). metricsURL overrides the default
 // baseURL+"/metrics" when non-empty (e.g. metrics served on a sidecar port). The
@@ -563,6 +679,7 @@ func (r *Recorder) RecordRequest(pending *PendingRequest, result *RequestRecord,
 		XRequestID:        result.XRequestID,
 		SessionID:         sessionID,
 		RoundIndex:        roundIndex,
+		Adapter:           pending.Adapter, // #1464: "" => the trailing adapter column is omitted entirely
 	})
 }
 

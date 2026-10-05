@@ -2,6 +2,7 @@ package workload
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/inference-sim/inference-sim/sim"
 )
@@ -26,6 +27,41 @@ func SpecHasAdapterFields(spec *WorkloadSpec) bool {
 		}
 	}
 	return false
+}
+
+// SpecAdapterIDs returns every distinct non-empty adapter id the spec references
+// (clients and cohorts), sorted. Sorted output keeps any diagnostic built from it
+// byte-identical across runs (INV-6); the slice is freshly allocated, so callers
+// cannot mutate spec state through it.
+//
+// A pure query, the list-valued companion to SpecHasAdapterFields: paths that
+// dispatch to a real server use it to preflight the referenced ids against the
+// adapters the target actually serves (#1464's "no registry to validate against"
+// is answerable by asking the server).
+func SpecAdapterIDs(spec *WorkloadSpec) []string {
+	if spec == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	for i := range spec.Clients {
+		if id := spec.Clients[i].Adapter; id != "" {
+			seen[id] = struct{}{}
+		}
+	}
+	for i := range spec.Cohorts {
+		if id := spec.Cohorts[i].Adapter; id != "" {
+			seen[id] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // ValidateAdapterReferences cross-checks every adapter id referenced by the workload
