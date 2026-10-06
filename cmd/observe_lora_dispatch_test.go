@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,7 +28,9 @@ import (
 //	L3 the gate is the ONLY place dispatch is enabled; off => adapter cleared
 //	L4 the adapter is attributed into the output TraceV2 adapter column
 //	L5 an output trace with no adapters carries no adapter column (inert)
-//	L6 preflight refuses an adapter the target server does not serve
+//	L6 preflight refuses an adapter the target server cannot serve; an adapter
+//	   missing from GET /v1/models is probed, since servers that load on first
+//	   use do not list it until requested
 //
 // L3 is what keeps the default path byte-identical: with the flag off the
 // adapter never reaches the wire OR the trace, so neither the request body nor
@@ -231,41 +234,82 @@ func TestListModels_ServerError(t *testing.T) {
 }
 
 func TestVerifyAdaptersServed(t *testing.T) {
+	// probeServes stubs ProbeAdapter: ids in ok load on demand, all others fail.
+	probeServes := func(ok ...string) func(string) error {
+		return func(id string) error {
+			for _, o := range ok {
+				if id == o {
+					return nil
+				}
+			}
+			return errors.New("HTTP 404: model does not exist")
+		}
+	}
 	tests := []struct {
-		name      string
-		want      []string
-		served    []string
-		wantErr   bool
-		errSubstr []string
+		name       string
+		want       []string
+		served     []string
+		probe      func(string) error
+		wantProbed []string
+		wantErr    bool
+		errSubstr  []string
 	}{
 		{
-			name:   "all adapters served",
+			name:   "all adapters listed: no probes",
 			want:   []string{"sql-lora", "code-lora"},
 			served: []string{"base-model", "code-lora", "sql-lora"},
+			probe:  probeServes(),
 		},
 		{
-			name:      "unknown adapter refused naming it and what is served",
-			want:      []string{"sql-lora", "typo-lora"},
-			served:    []string{"base-model", "sql-lora"},
-			wantErr:   true,
-			errSubstr: []string{"typo-lora", "sql-lora"},
+			name:       "unlisted adapter that loads on first use passes",
+			want:       []string{"sql-lora", "code-lora"},
+			served:     []string{"base-model", "sql-lora"},
+			probe:      probeServes("code-lora"),
+			wantProbed: []string{"code-lora"},
 		},
 		{
-			name:      "server serves nothing",
-			want:      []string{"sql-lora"},
-			served:    nil,
-			wantErr:   true,
-			errSubstr: []string{"sql-lora"},
+			name:       "nothing listed: every adapter probed, in sorted order",
+			want:       []string{"sql-lora", "code-lora"},
+			served:     []string{"base-model"},
+			probe:      probeServes("sql-lora", "code-lora"),
+			wantProbed: []string{"code-lora", "sql-lora"},
+		},
+		{
+			name:       "unlisted adapter whose probe fails is refused naming it, the cause, and what is listed",
+			want:       []string{"sql-lora", "typo-lora"},
+			served:     []string{"base-model", "sql-lora"},
+			probe:      probeServes(),
+			wantProbed: []string{"typo-lora"},
+			wantErr:    true,
+			errSubstr:  []string{"typo-lora", "404", "base-model, sql-lora"},
+		},
+		{
+			name:       "server lists nothing and probe fails",
+			want:       []string{"sql-lora"},
+			served:     nil,
+			probe:      probeServes(),
+			wantProbed: []string{"sql-lora"},
+			wantErr:    true,
+			errSubstr:  []string{"sql-lora", "<none>"},
 		},
 		{
 			name:   "no adapters referenced is vacuously satisfied",
 			want:   nil,
 			served: []string{"base-model"},
+			probe:  probeServes(),
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := verifyAdaptersServed(tc.want, tc.served)
+			var probed []string
+			probe := func(id string) error {
+				probed = append(probed, id)
+				return tc.probe(id)
+			}
+			err := verifyAdaptersServed(tc.want, tc.served, probe)
+			if strings.Join(probed, ",") != strings.Join(tc.wantProbed, ",") {
+				t.Errorf("probed %v, want %v (only unlisted adapters are probed)", probed, tc.wantProbed)
+			}
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("verifyAdaptersServed(%v, %v) = nil, want error", tc.want, tc.served)
@@ -281,6 +325,36 @@ func TestVerifyAdaptersServed(t *testing.T) {
 				t.Errorf("verifyAdaptersServed(%v, %v) = %v, want nil", tc.want, tc.served, err)
 			}
 		})
+	}
+}
+
+func TestProbeAdapter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["max_tokens"] != 1.0 {
+			t.Errorf("probe max_tokens = %v, want 1", body["max_tokens"])
+		}
+		if body["model"] != "sql-lora" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"model does not exist"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{{"text": "ok"}},
+			"usage":   map[string]interface{}{"prompt_tokens": 1.0, "completion_tokens": 1.0},
+		})
+	}))
+	defer server.Close()
+
+	client := NewRealClient(server.URL, "", "base-model", "vllm")
+	if err := client.ProbeAdapter(context.Background(), "sql-lora"); err != nil {
+		t.Errorf("ProbeAdapter(served adapter) = %v, want nil", err)
+	}
+	err := client.ProbeAdapter(context.Background(), "typo-lora")
+	if err == nil || !strings.Contains(err.Error(), "404") {
+		t.Errorf("ProbeAdapter(unknown adapter) = %v, want an error carrying the HTTP 404", err)
 	}
 }
 
@@ -397,7 +471,8 @@ clients:
 }
 
 // adapterDispatchServer records every "model" value it is asked to complete and
-// serves a /v1/models listing containing base + both adapters.
+// serves a /v1/models listing of served. It completes any model name, so an
+// unlisted adapter behaves like one the server loads on first use.
 func adapterDispatchServer(t *testing.T, served []string) (*httptest.Server, func() []string) {
 	t.Helper()
 	var mu sync.Mutex
@@ -432,11 +507,12 @@ func adapterDispatchServer(t *testing.T, served []string) (*httptest.Server, fun
 	}
 }
 
-// runObserveForAdapters drives a full spec-mode observe run and returns the
-// exported trace plus every model name the server was asked to complete.
-func runObserveForAdapters(t *testing.T, dispatch bool) (*workload.TraceV2, []string) {
+// runObserveForAdapters drives a full spec-mode observe run against a server whose
+// GET /v1/models lists served, and returns the exported trace plus every model name
+// the server was asked to complete.
+func runObserveForAdapters(t *testing.T, dispatch bool, served []string) (*workload.TraceV2, []string) {
 	t.Helper()
-	srv, seenModels := adapterDispatchServer(t, []string{"base-model", "sql-lora", "code-lora"})
+	srv, seenModels := adapterDispatchServer(t, served)
 	defer srv.Close()
 
 	dir := t.TempDir()
@@ -491,7 +567,7 @@ func runObserveForAdapters(t *testing.T, dispatch bool) (*workload.TraceV2, []st
 // TestObserveE2E_DispatchAdaptersOn is the law that matters: with the flag on, the
 // adapter ids reach the real wire and are attributed in the exported trace.
 func TestObserveE2E_DispatchAdaptersOn(t *testing.T) {
-	trace, models := runObserveForAdapters(t, true)
+	trace, models := runObserveForAdapters(t, true, []string{"base-model", "sql-lora", "code-lora"})
 
 	if len(models) == 0 {
 		t.Fatal("server received no completion requests")
@@ -536,7 +612,7 @@ func TestObserveE2E_DispatchAdaptersOn(t *testing.T) {
 // TestObserveE2E_DispatchAdaptersOff pins the default path: the adapter is dropped
 // at the gate, so every request names the base model and the trace stays blind.
 func TestObserveE2E_DispatchAdaptersOff(t *testing.T) {
-	trace, models := runObserveForAdapters(t, false)
+	trace, models := runObserveForAdapters(t, false, []string{"base-model", "sql-lora", "code-lora"})
 
 	if len(models) == 0 {
 		t.Fatal("server received no completion requests")
@@ -550,5 +626,37 @@ func TestObserveE2E_DispatchAdaptersOff(t *testing.T) {
 		if r.Adapter != "" {
 			t.Errorf("exported trace carries adapter %q with dispatch off; want adapter-blind", r.Adapter)
 		}
+	}
+}
+
+// TestObserveE2E_DispatchAdaptersLoadOnFirstUse covers a server that lists only
+// the base model until an adapter is requested: each adapter is probed exactly
+// once before measurement, then every measured request names its adapter.
+func TestObserveE2E_DispatchAdaptersLoadOnFirstUse(t *testing.T) {
+	trace, models := runObserveForAdapters(t, true, []string{"base-model"})
+
+	seen := map[string]int{}
+	for _, m := range models {
+		seen[m]++
+	}
+	recorded := map[string]int{}
+	for _, r := range trace.Records {
+		recorded[r.Adapter]++
+	}
+	if seen["base-model"] != 1 {
+		t.Errorf("base model named %d times, want exactly 1 (the tokenizer-calibration probe); models seen: %v",
+			seen["base-model"], models)
+	}
+	for _, a := range []string{"sql-lora", "code-lora"} {
+		if recorded[a] == 0 {
+			t.Errorf("exported trace does not attribute adapter %q; got %v", a, recorded)
+		}
+		if seen[a] != recorded[a]+1 {
+			t.Errorf("adapter %q named %d times on the wire for %d measured requests; want exactly one extra (the preflight probe)",
+				a, seen[a], recorded[a])
+		}
+	}
+	if recorded[""] != 0 {
+		t.Errorf("%d measured request(s) carry no adapter; the probe must not leak into the trace", recorded[""])
 	}
 }

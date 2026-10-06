@@ -175,7 +175,7 @@ func init() {
 	observeCmd.Flags().IntVar(&observeConcurrentSessions, "concurrent-sessions", 0, "Replay a fixed pool of N concurrent closed-loop sessions from --corpus-* against the server (0 = disabled). Mutually exclusive with spec-mode inputs (--workload/--workload-spec/--rate/--concurrency).")
 	observeCmd.Flags().IntVar(&observeTotalSessions, "total-sessions", 0, "Total sessions to replay under --concurrent-sessions; duplicates the corpus (with cache-busting) to fill. 0 = replay each corpus session once.")
 	observeCmd.Flags().DurationVar(&observeDuration, "duration", 0, "Bound a corpus run by TIME instead of session count (e.g. 20m): once this much of the measured window has elapsed, STOP SENDING \u2014 no new sessions and no further rounds of sessions already running \u2014 then wait for requests already on the wire to finish. Sessions cut off mid-conversation are recorded as far as they got, so the output trace contains partial sessions. Until the bound the session queue is open-ended (the corpus is cycled with cache-busting clones), so it never runs dry. Measured from the start of the dispatch loop, so it excludes --prewarm-duration and tokenizer calibration. Requires --concurrent-sessions > 0; mutually exclusive with --total-sessions.")
-	observeCmd.Flags().BoolVar(&observeDispatchAdapters, "dispatch-adapters", false, "EXPERIMENTAL (#1464): honor per-request LoRA adapter ids on the wire. Each request names its adapter in the body's \"model\" field instead of --model, and the adapter is recorded in the output trace's adapter column so `blis calibrate` can attribute per-adapter latency. Every adapter id the spec references is preflighted against the server's GET /v1/models at startup and an unserved id is refused. --model stays required as the base-model fallback for adapter-blind requests, prewarm, and tokenizer calibration. Off (default): adapter ids are ignored, as before. Requires --workload-spec; invalid in corpus-mode.")
+	observeCmd.Flags().BoolVar(&observeDispatchAdapters, "dispatch-adapters", false, "EXPERIMENTAL (#1464): honor per-request LoRA adapter ids on the wire. Each request names its adapter in the body's \"model\" field instead of --model, and the adapter is recorded in the output trace's adapter column so `blis calibrate` can attribute per-adapter latency. At startup every adapter id the spec references is checked against the server's GET /v1/models; an unlisted id (e.g. one the server loads on first use) is probed with a 1-token request, and an id the server cannot serve is refused. --model stays required as the base-model fallback for adapter-blind requests, prewarm, and tokenizer calibration. Off (default): adapter ids are ignored, as before. Requires --workload-spec; invalid in corpus-mode.")
 	observeCmd.Flags().BoolVar(&observeShuffleCorpus, "shuffle-corpus", false, "Randomize the corpus step/admission order (seeded from --seed; uses the SAME permutation as `blis replay --shuffle-corpus`, so observe and replay of one corpus+seed select the same subset — for calibration parity). Requires --concurrent-sessions > 0. With --total-sessions < corpus this yields a seeded-random subset; every session still runs otherwise.")
 	observeCmd.Flags().StringVar(&observeSessionIDHeader, "session-id-header", defaultSessionIDHeader, "Request header carrying the closed-loop session id for session-aware EPP routing (session-affinity / predictive pinning). Must match the deployment's session-id-producer. Empty disables emission (issue #1505).")
 
@@ -506,9 +506,10 @@ func runObserve(cmd *cobra.Command, _ []string) {
 		//
 		//   --dispatch-adapters ON (experimental): the target server manages adapter
 		//   loading, so the server IS the registry. Preflight every referenced id
-		//   against GET /v1/models and refuse an unserved one before any measurement
-		//   begins — a wrong id would otherwise be answered from the base model and
-		//   read as a successful run.
+		//   against GET /v1/models (probing any unlisted id with a 1-token request)
+		//   and refuse an unservable one before any measurement begins — a wrong id
+		//   would otherwise be answered from the base model and read as a
+		//   successful run.
 		specAdapters := workload.SpecAdapterIDs(spec)
 		switch {
 		case !observeDispatchAdapters && len(specAdapters) > 0:
@@ -616,7 +617,13 @@ func runObserve(cmd *cobra.Command, _ []string) {
 			logrus.Fatalf("--dispatch-adapters preflight failed: could not list the models served by %s: %v",
 				observeServerURL, err)
 		}
-		if err := verifyAdaptersServed(dispatchAdapterIDs, served); err != nil {
+		// Adapters loaded on first use are not listed yet; probe those directly.
+		probe := func(id string) error {
+			probeCtx, probeCancel := context.WithTimeout(context.Background(), time.Duration(observeTimeout)*time.Second)
+			defer probeCancel()
+			return client.ProbeAdapter(probeCtx, id)
+		}
+		if err := verifyAdaptersServed(dispatchAdapterIDs, served, probe); err != nil {
 			logrus.Fatalf("--dispatch-adapters preflight failed: %v", err)
 		}
 		logrus.Infof("--dispatch-adapters: preflighted %d adapter(s) against %s: %s",

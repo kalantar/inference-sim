@@ -542,40 +542,66 @@ func (c *RealClient) ListModels(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// verifyAdaptersServed reports whether every referenced adapter id appears among
-// the ids the server serves. A missing adapter is a hard error naming the offending
-// id AND what the server does serve, because the realistic cause is a typo or an
-// adapter that was never loaded — and the failure mode without this check is the
-// server quietly answering from the base model, which looks like a successful run
-// with suspiciously uniform latency.
-//
-// Pure (both inputs are arguments), so the rule is table-testable without a server.
-func verifyAdaptersServed(referenced, served []string) error {
-	if len(referenced) == 0 {
-		return nil // base-model-only workload: nothing to preflight
+// ProbeAdapter sends a 1-token completion naming adapter id and reports whether
+// the server answered it. It covers servers that load adapters on first use (e.g.
+// vLLM's runtime LoRA resolver): such an adapter is absent from GET /v1/models
+// until something requests it. A successful probe also loads the adapter, so the
+// first measured request for it does not pay the load latency.
+func (c *RealClient) ProbeAdapter(ctx context.Context, id string) error {
+	record, err := c.Send(ctx, &PendingRequest{
+		RequestID:       -1,
+		Prompt:          "Hello",
+		MaxOutputTokens: 1,
+		Adapter:         id,
+	})
+	if err != nil {
+		return err
 	}
+	if record.Status != "ok" {
+		return errors.New(record.ErrorMessage)
+	}
+	return nil
+}
+
+// verifyAdaptersServed reports whether every referenced adapter id is servable.
+// An id listed in served (from GET /v1/models) passes without a request; an
+// unlisted id is passed to probe, and passes iff probe returns nil. Any failure is
+// a hard error naming the offending id(s), the probe error, AND what the server
+// lists, because the realistic cause is a typo or an adapter that was never made
+// available — and the failure mode without this check is the server quietly
+// answering from the base model, which looks like a successful run with
+// suspiciously uniform latency.
+//
+// Pure apart from probe, so the rule is table-testable without a server.
+func verifyAdaptersServed(referenced, served []string, probe func(id string) error) error {
 	have := make(map[string]struct{}, len(served))
 	for _, id := range served {
 		have[id] = struct{}{}
 	}
-	var missing []string
+	unlisted := make([]string, 0, len(referenced))
 	for _, id := range referenced {
 		if _, ok := have[id]; !ok {
-			missing = append(missing, id)
+			unlisted = append(unlisted, id)
 		}
 	}
-	if len(missing) == 0 {
+	sort.Strings(unlisted)
+	var failures []string
+	for _, id := range unlisted {
+		if err := probe(id); err != nil {
+			failures = append(failures, fmt.Sprintf("%s (%v)", id, err))
+		}
+	}
+	if len(failures) == 0 {
 		return nil
 	}
-	sort.Strings(missing)
 	available := append([]string(nil), served...)
 	sort.Strings(available)
 	servedDesc := strings.Join(available, ", ")
 	if servedDesc == "" {
 		servedDesc = "<none>"
 	}
-	return fmt.Errorf("the target server does not serve adapter(s) %s; it serves: %s",
-		strings.Join(missing, ", "), servedDesc)
+	return fmt.Errorf("the target server cannot serve adapter(s) %s; GET /v1/models lists: %s",
+		strings.Join(failures, ", "), servedDesc)
 }
 
 // ScrapeKVMetrics fetches the server's Prometheus /metrics endpoint and parses it
